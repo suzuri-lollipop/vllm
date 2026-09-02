@@ -75,6 +75,83 @@ from vllm import LLM
 llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", enforce_eager=True)
 ```
 
+## Weight offloading
+
+Model weights that do not fit in device memory can be placed in host memory or on
+a storage device. Which weights go where is controlled per parameter and per
+layer, so the parts of the model that dominate the memory footprint can be moved
+out while the rest stays resident on the GPU.
+
+`--cpu-offload-params` (UVA backend) and `--offload-params` (prefetch backend)
+select *which* parameters are eligible, matching on full dot-separated name
+segments: `experts` matches `mlp.experts.w13_weight`, `w13` matches nothing.
+`--offload-layers` selects *which* decoder layers those parameters are taken
+from, as a comma-separated list of indices and inclusive ranges. Indices are
+global, so they mean the same thing with and without pipeline parallelism.
+
+For a MoE model, this is how the expert weights of the upper layers are pinned to
+host memory while the lower layers keep their experts in VRAM:
+
+```bash
+vllm serve <model> \
+    --cpu-offload-params experts \
+    --offload-layers 24-47
+```
+
+Without `--offload-layers`, the UVA backend instead offloads layers in order
+until `--cpu-offload-gb` is reached, and the prefetch backend offloads the last
+`--offload-num-in-group` layers of every `--offload-group-size` layers. With
+`--offload-layers`, `--cpu-offload-gb` becomes an optional cap: leaving it at 0
+offloads exactly the selected layers.
+
+Offloaded weights are read over PCIe on every forward pass, so start by
+offloading the layers that are cheapest to stream and measure before widening
+the selection.
+
+## Disk-backed embedding tables
+
+Some models carry embedding tables that are far larger than the rest of the
+model and are read only a handful of rows at a time — most notably the n-gram
+hash embeddings of per-layer embedding (PLE) models, whose vocabulary runs into
+the hundreds of millions of rows. Those tables can be memory-mapped from a
+storage device instead of occupying device or host memory, with only the
+gathered rows copied to the GPU:
+
+```bash
+vllm serve <model> \
+    --disk-offload-path /mnt/optane/vllm \
+    --disk-offload-params ngram_embedding
+```
+
+`--disk-offload-path` should point at a fast, low-latency device, since every
+forward pass issues a random read per looked-up row. An NVMe SSD works; an Intel
+Optane persistent memory module exposed through a DAX filesystem is a better fit
+for this access pattern. `--disk-offload-layers` narrows the mapping to specific
+layers, and `--disk-offload-keep-files` leaves the backing files in place on
+exit instead of unlinking them.
+
+Disk offloading is applied *in addition to* `--offload-backend`, so it composes
+with the CPU offloading above:
+
+```bash
+vllm serve <model> \
+    --cpu-offload-params experts \
+    --offload-layers 24-47 \
+    --disk-offload-path /mnt/optane/vllm \
+    --disk-offload-params ngram_embedding
+```
+
+!!! note
+    CUDA graphs are disabled automatically when `--disk-offload-path` is set:
+    the row gather runs on the host, which a CUDA graph cannot capture.
+
+!!! note
+    Only embedding tables can be disk-backed: a memory-mapped weight is never
+    materialized on the device, so its layer has to consume it through a sparse
+    row lookup rather than a dense matmul. Naming a dense parameter in
+    `--disk-offload-params` is rejected at startup — use `--cpu-offload-gb` or
+    `--offload-group-size` for those.
+
 ## Adjust cache size
 
 If you run out of CPU RAM, try the following options:

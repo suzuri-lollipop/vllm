@@ -163,6 +163,10 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
+        # Disk-backed parameters are memory-mapped tables that are far too
+        # large for device memory; they are read through a host-side gather.
+        if getattr(p, "_vllm_is_disk_offloaded", False):
+            continue
         if p.device.type == "cpu":
             cpu_params.add(name)
             p.data = p.data.to(target_device)

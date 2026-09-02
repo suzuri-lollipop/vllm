@@ -135,6 +135,8 @@ class PrefetchOffloader(BaseOffloader):
         group_size: Group every N layers together.
         num_in_group: Offload this many layers per group (last N of each group).
         prefetch_step: Number of layers to prefetch ahead.
+        offload_layers: Explicit global layer indices to offload. When given,
+            it replaces the group pattern.
         mode: Offload mode ("cpu" is currently supported).
     """
 
@@ -144,12 +146,14 @@ class PrefetchOffloader(BaseOffloader):
         num_in_group: int,
         prefetch_step: int,
         offload_params: set[str] | None = None,
+        offload_layers: frozenset[int] | None = None,
         mode: str = "cpu",
     ):
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
         self.offload_params = offload_params or set()
+        self.offload_layers = offload_layers
         self.mode = mode
 
         # Copy stream for async H2D transfers
@@ -164,6 +168,7 @@ class PrefetchOffloader(BaseOffloader):
         self,
         modules_generator: Generator[nn.Module, None, None],
         prefix: str = "",
+        start_index: int = 0,
     ) -> list[nn.Module]:
         """Wrap modules with prefetch offloading logic."""
         assert len(self.module_offloaders) == 0, (
@@ -179,9 +184,16 @@ class PrefetchOffloader(BaseOffloader):
         for module_index, module in enumerate(modules_generator):
             all_modules.append(module)
 
-            # Select layers to offload based on group pattern
-            # Offload last num_in_group layers of each group_size
-            if module_index % self.group_size >= self.group_size - self.num_in_group:
+            # Select layers to offload: an explicit selection if the user
+            # gave one, otherwise the last num_in_group layers of each group.
+            if self.offload_layers is not None:
+                selected = start_index + module_index in self.offload_layers
+            else:
+                selected = (
+                    module_index % self.group_size
+                    >= self.group_size - self.num_in_group
+                )
+            if selected:
                 if self.offload_params:
                     whitelist = [
                         name

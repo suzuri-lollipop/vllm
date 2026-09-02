@@ -40,6 +40,7 @@ from vllm.config import (
     ConfigType,
     DeviceConfig,
     DiffusionConfig,
+    DiskOffloadConfig,
     ECTransferConfig,
     EncoderCacheManagerConfig,
     EPLBConfig,
@@ -539,6 +540,11 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    offload_layers: str = OffloadConfig.offload_layers
+    disk_offload_path: str = DiskOffloadConfig.disk_offload_path
+    disk_offload_params: set[str] = get_field(DiskOffloadConfig, "disk_offload_params")
+    disk_offload_layers: str = DiskOffloadConfig.disk_offload_layers
+    disk_offload_keep_files: bool = DiskOffloadConfig.disk_offload_keep_files
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1294,6 +1300,7 @@ class EngineArgs:
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
         prefetch_kwargs = get_kwargs(PrefetchOffloadConfig)
+        disk_kwargs = get_kwargs(DiskOffloadConfig)
         offload_group = parser.add_argument_group(
             title="OffloadConfig",
             description=OffloadConfig.__doc__,
@@ -1319,6 +1326,21 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
+        )
+        offload_group.add_argument(
+            "--offload-layers", **offload_kwargs["offload_layers"]
+        )
+        offload_group.add_argument(
+            "--disk-offload-path", **disk_kwargs["disk_offload_path"]
+        )
+        offload_group.add_argument(
+            "--disk-offload-params", **disk_kwargs["disk_offload_params"]
+        )
+        offload_group.add_argument(
+            "--disk-offload-layers", **disk_kwargs["disk_offload_layers"]
+        )
+        offload_group.add_argument(
+            "--disk-offload-keep-files", **disk_kwargs["disk_offload_keep_files"]
         )
 
         # Multimodal related configs
@@ -2544,6 +2566,13 @@ class EngineArgs:
                 offload_prefetch_step=self.offload_prefetch_step,
                 offload_params=self.offload_params,
             ),
+            disk=DiskOffloadConfig(
+                disk_offload_path=self.disk_offload_path,
+                disk_offload_params=self.disk_offload_params,
+                disk_offload_layers=self.disk_offload_layers,
+                disk_offload_keep_files=self.disk_offload_keep_files,
+            ),
+            offload_layers=self.offload_layers,
         )
 
         if self.gdn_prefill_backend is not None:

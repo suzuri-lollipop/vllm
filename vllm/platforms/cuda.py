@@ -330,6 +330,18 @@ class CudaPlatformBase(Platform):
             )
             scheduler_config.disable_chunked_mm_input = True
 
+        from vllm.config.compilation import CUDAGraphMode
+
+        if (
+            vllm_config.offload_config.disk.disk_offload_path
+            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            logger.warning_once(
+                "Disabling CUDA graphs: --disk-offload-path gathers embedding "
+                "rows on the host, which cannot be captured in a CUDA graph."
+            )
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         if (
             in_wsl()
             and vllm_config.offload_config.uva.cpu_offload_gb > 0

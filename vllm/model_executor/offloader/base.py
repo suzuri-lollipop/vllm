@@ -65,6 +65,7 @@ class BaseOffloader(ABC):
         self,
         modules_generator: Generator[nn.Module, None, None],
         prefix: str = "",
+        start_index: int = 0,
     ) -> list[nn.Module]:
         """Wrap modules with offloading logic.
 
@@ -74,6 +75,9 @@ class BaseOffloader(ABC):
                 them against the offloading parameter set. Used when the
                 modules are not the full model, so that name segments stay
                 fully qualified (e.g. `visual` for a tower module).
+            start_index: Global index of the first yielded module. Set by
+                `make_layers` to the pipeline rank's first layer, so explicit
+                layer selections refer to global layer indices.
 
         Returns:
             List of modules, potentially with offloading hooks installed.
@@ -114,9 +118,58 @@ class NoopOffloader(BaseOffloader):
         self,
         modules_generator: Generator[nn.Module, None, None],
         prefix: str = "",
+        start_index: int = 0,
     ) -> list[nn.Module]:
         """Return modules unchanged."""
         return list(modules_generator)
+
+
+class CompositeOffloader(BaseOffloader):
+    """Applies several offloaders to the same modules, in order.
+
+    Used to combine disk-backed embedding offloading with a CPU offloading
+    backend, which target disjoint parameters.
+    """
+
+    def __init__(self, offloaders: list[BaseOffloader]):
+        assert offloaders, "CompositeOffloader requires at least one offloader"
+        self.offloaders = offloaders
+        self.supports_tower_offload = all(
+            offloader.supports_tower_offload for offloader in offloaders
+        )
+
+    def wrap_modules(
+        self,
+        modules_generator: Generator[nn.Module, None, None],
+        prefix: str = "",
+        start_index: int = 0,
+    ) -> list[nn.Module]:
+        modules: list[nn.Module] = list(modules_generator)
+        for offloader in self.offloaders:
+            modules = offloader.wrap_modules(
+                iter(modules), prefix=prefix, start_index=start_index
+            )
+        return modules
+
+    def post_init(self):
+        for offloader in self.offloaders:
+            offloader.post_init()
+
+    def sync_prev_onload(self) -> None:
+        for offloader in self.offloaders:
+            offloader.sync_prev_onload()
+
+    def join_after_forward(self) -> None:
+        for offloader in self.offloaders:
+            offloader.join_after_forward()
+
+    def _wait_for_layer(self, layer_idx: int) -> None:
+        for offloader in self.offloaders:
+            offloader._wait_for_layer(layer_idx)
+
+    def _start_prefetch(self, layer_idx: int) -> None:
+        for offloader in self.offloaders:
+            offloader._start_prefetch(layer_idx)
 
 
 # Global singleton offloader instance (defaults to no-op).
@@ -142,36 +195,56 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     """Create an offloader based on the offload configuration.
 
     Uses the explicit ``offload_backend`` selector.  When set to ``"auto"``,
-    selects prefetch if ``offload_group_size > 0``, UVA if
-    ``cpu_offload_gb > 0``, otherwise noop.
+    selects prefetch if ``offload_group_size > 0``, UVA if ``cpu_offload_gb >
+    0`` or an explicit ``offload_layers`` selection is given, otherwise noop.
+    Disk-backed embedding offloading is applied in addition to the selected
+    backend whenever ``disk_offload_path`` is set.
     """
+    from vllm.model_executor.offloader.disk import DiskOffloader
+    from vllm.model_executor.offloader.layer_selection import parse_layer_spec
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
 
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
+    disk = offload_config.disk
+    offload_layers = parse_layer_spec(offload_config.offload_layers)
 
     if backend == "auto":
         if prefetch.offload_group_size > 0:
             backend = "prefetch"
-        elif uva.cpu_offload_gb > 0:
+        elif uva.cpu_offload_gb > 0 or offload_layers is not None:
             backend = "uva"
-        else:
-            return NoopOffloader()
 
+    base: BaseOffloader
     if backend == "prefetch":
-        return PrefetchOffloader(
+        base = PrefetchOffloader(
             group_size=prefetch.offload_group_size,
             num_in_group=prefetch.offload_num_in_group,
             prefetch_step=prefetch.offload_prefetch_step,
             offload_params=prefetch.offload_params,
+            offload_layers=offload_layers,
             mode="cpu",
         )
     elif backend == "uva":
-        return UVAOffloader(
+        base = UVAOffloader(
             cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
             cpu_offload_params=uva.cpu_offload_params,
+            offload_layers=offload_layers,
         )
     else:
-        return NoopOffloader()
+        base = NoopOffloader()
+
+    if not disk.disk_offload_path:
+        return base
+
+    disk_offloader = DiskOffloader(
+        path=disk.disk_offload_path,
+        offload_params=disk.disk_offload_params,
+        offload_layers=parse_layer_spec(disk.disk_offload_layers),
+        keep_files=disk.disk_offload_keep_files,
+    )
+    if isinstance(base, NoopOffloader):
+        return disk_offloader
+    return CompositeOffloader([disk_offloader, base])

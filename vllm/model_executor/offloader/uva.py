@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """UVA-based CPU offloading using Unified Virtual Addressing."""
 
+import sys
 from collections.abc import Generator
 
 import torch
@@ -29,9 +30,13 @@ class UVAOffloader(BaseOffloader):
     approach that moves parameters on-demand.
 
     Args:
-        cpu_offload_max_bytes: Maximum bytes to offload to CPU.
+        cpu_offload_max_bytes: Maximum bytes to offload to CPU. When
+            `offload_layers` is given, 0 means no byte limit: the selected
+            layers are offloaded in full.
         cpu_offload_params: Set of parameter name segments to selectively
             offload. If empty, all parameters are eligible up to the byte limit.
+        offload_layers: Global layer indices to restrict offloading to. If
+            None, layers are offloaded in order until the byte limit is hit.
     """
 
     supports_tower_offload = True
@@ -40,10 +45,16 @@ class UVAOffloader(BaseOffloader):
         self,
         cpu_offload_max_bytes: int,
         cpu_offload_params: set[str] | None = None,
+        offload_layers: frozenset[int] | None = None,
     ):
+        # An explicit layer selection without a byte budget means "offload
+        # exactly these layers", so the budget must not cut the selection short.
+        if offload_layers is not None and cpu_offload_max_bytes == 0:
+            cpu_offload_max_bytes = sys.maxsize
         self.cpu_offload_max_bytes = cpu_offload_max_bytes
         self.cpu_offload_bytes = 0
         self.cpu_offload_params = cpu_offload_params or set()
+        self.offload_layers = offload_layers
 
         self.pin_memory = should_pin_memory()
         self.uva_offloading = (
@@ -54,13 +65,20 @@ class UVAOffloader(BaseOffloader):
         self,
         modules_generator: Generator[nn.Module, None, None],
         prefix: str = "",
+        start_index: int = 0,
     ) -> list[nn.Module]:
         """Wrap modules with UVA offloading."""
         if prefix:
             prefix = f"{prefix}."
-        modules = [
-            self._maybe_offload_to_cpu(module, prefix) for module in modules_generator
-        ]
+        modules = []
+        for offset, module in enumerate(modules_generator):
+            if (
+                self.offload_layers is not None
+                and start_index + offset not in self.offload_layers
+            ):
+                modules.append(module)
+                continue
+            modules.append(self._maybe_offload_to_cpu(module, prefix))
         if self.cpu_offload_bytes > 0:
             logger.info(
                 "Total CPU offloaded parameters: %s",
@@ -93,7 +111,11 @@ class UVAOffloader(BaseOffloader):
             # Skip parameters an earlier wrap_modules call already offloaded.
             # The UVA path leaves p.device as the accelerator (a view of CPU
             # memory), so the marker is the only way to recognize those.
-            if p.device.type == "cpu" or getattr(p, "_vllm_is_uva_offloaded", False):
+            if (
+                p.device.type == "cpu"
+                or getattr(p, "_vllm_is_uva_offloaded", False)
+                or getattr(p, "_vllm_is_disk_offloaded", False)
+            ):
                 continue
 
             if self.cpu_offload_params:

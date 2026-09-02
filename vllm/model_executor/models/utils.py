@@ -856,7 +856,11 @@ def make_layers(
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + get_offloader().wrap_modules(
-            layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+            (
+                layer_fn(prefix=f"{prefix}.{idx}")
+                for idx in range(start_layer, end_layer)
+            ),
+            start_index=start_layer,
         )
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )

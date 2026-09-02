@@ -77,6 +77,42 @@ class PrefetchOffloadConfig:
 
 
 @config
+class DiskOffloadConfig:
+    """Configuration for disk-backed offloading of large embedding tables.
+
+    Memory-maps the selected parameters from a file instead of holding them in
+    device or host memory, and gathers the needed rows on the host. Intended
+    for sparsely read tables that do not fit anywhere else, such as the n-gram
+    hash embeddings of per-layer embedding (PLE) models.
+
+    This is applied in addition to `offload_backend`, not instead of it.
+    """
+
+    disk_offload_path: str = ""
+    """Directory holding the memory-mapped parameter files. Point it at an
+    NVMe SSD mount, or at an Intel Optane persistent memory device exposed
+    through a DAX filesystem, to keep the tables off host and device memory.
+    Empty (the default) disables disk offloading."""
+
+    disk_offload_params: set[str] = Field(default_factory=set)
+    """The set of parameter name segments to memory-map. Required when
+    `disk_offload_path` is set; disk offloading is never applied
+    non-selectively. Uses the same full-segment matching as
+    `cpu_offload_params`, e.g. "ngram_embedding" matches
+    "ple.ngram.ngram_embedding.weight"."""
+
+    disk_offload_layers: str = ""
+    """Decoder layer indices whose matching parameters are memory-mapped, as a
+    comma-separated list of indices and inclusive ranges, e.g. "0,2,24-47".
+    Indices are global and unaffected by pipeline parallelism. Empty (the
+    default) memory-maps every matching parameter."""
+
+    disk_offload_keep_files: bool = False
+    """Keep the backing files on exit instead of deleting them. Useful on a
+    dedicated Optane or SSD partition where the space is reserved anyway."""
+
+
+@config
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
@@ -94,10 +130,49 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
+    disk: DiskOffloadConfig = Field(default_factory=DiskOffloadConfig)
+    """Parameters for disk-backed embedding offloading. Applied in addition to
+    the backend selected by `offload_backend`."""
+
+    offload_layers: str = ""
+    """Decoder layer indices to offload, as a comma-separated list of indices
+    and inclusive ranges, e.g. "0,2,24-47". Indices are global and unaffected
+    by pipeline parallelism. This overrides the layer selection of the active
+    backend: the UVA backend offloads only these layers (up to
+    `cpu_offload_gb`, or without a byte limit when it is 0) and the prefetch
+    backend ignores its group pattern. Combine it with `cpu_offload_params` /
+    `offload_params` to pin, for example, the experts of the second half of
+    the model to host memory while the rest stays resident in device memory.
+    Empty (the default) keeps each backend's own selection."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
-        if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
+        from vllm.model_executor.offloader.layer_selection import parse_layer_spec
+
+        # Surface a malformed layer selection at config time.
+        parse_layer_spec(self.offload_layers)
+        parse_layer_spec(self.disk.disk_offload_layers)
+
+        if self.disk.disk_offload_path and not self.disk.disk_offload_params:
+            raise ValueError(
+                "disk_offload_path requires disk_offload_params: disk "
+                "offloading is only applied to explicitly named embedding "
+                "tables."
+            )
+        if self.disk.disk_offload_params and not self.disk.disk_offload_path:
+            warnings.warn(
+                "disk_offload_params is set but disk_offload_path is empty. "
+                "Disk offloading will not be applied.",
+                stacklevel=2,
+            )
+
+        prefetch_selected = (
+            self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0
+        )
+        # An explicit layer selection replaces the group pattern, so the group
+        # fields are unused and need not be consistent.
+        if prefetch_selected and not self.offload_layers:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
                     f"offload_num_in_group ({self.prefetch.offload_num_in_group})"
