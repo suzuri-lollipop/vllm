@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Expert-granularity MoE offloading backend ("expert_cache").
+
+Dives the routed expert weights (w13/w2 of every MoE layer) into pinned host
+memory at model-construction time and rebuilds them on the GPU as a single global
+LRU slot cache (see :mod:`vllm.model_executor.layers.fused_moe.offload`). This is
+the offloader half; the forward / GEMM half lives on
+:class:`~vllm.model_executor.layers.fused_moe.offload.routed_experts.OffloadRoutedExperts`.
+
+The diversion happens in :meth:`wrap_modules` (during ``make_layers``) so a MoE
+model larger than VRAM never holds all expert weights on the GPU at once -- each
+decoder layer's experts are moved to pinned host right after that layer is
+constructed, mirroring how the UVA/prefetch offloaders bound their GPU footprint.
+The global slot cache is finalized in :meth:`post_init`, after every layer has
+registered its host banks.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Generator
+
+import torch
+import torch.nn as nn
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.offload.slot_cache import (
+    BANK_SCHEMAS,
+    BANK_TO_PARAM,
+    ExpertSlotCache,
+    set_global_slot_cache,
+)
+from vllm.model_executor.offloader.base import BaseOffloader
+from vllm.utils.mem_utils import format_gib
+from vllm.utils.platform_utils import is_pin_memory_available
+
+logger = init_logger(__name__)
+
+# Attribute marker set on diverted expert params so the generic weight loader /
+# process_weights_after_loading machinery (device_loading_context) leaves them on
+# the host instead of bouncing them through the GPU.
+EXPERT_OFFLOADED_ATTR = "_vllm_is_expert_offloaded"
+
+
+class ExpertCacheOffloader(BaseOffloader):
+    """Offloader that keeps routed MoE experts in pinned host memory and serves
+    them through a global GPU LRU slot cache.
+
+    Args:
+        cache_size: number of expert slots in the global GPU slot cache.
+        pin_memory: page-lock the host banks (required for fast async H2D).
+        quant_format: bank layout key (only "bf16" is supported in phase 1).
+    """
+
+    def __init__(
+        self,
+        cache_size: int,
+        pin_memory: bool = True,
+        quant_format: str = "bf16",
+    ):
+        self.cache_size = cache_size
+        self.pin_memory = pin_memory and is_pin_memory_available()
+        self.quant_format = quant_format
+        assert quant_format in BANK_SCHEMAS, f"unknown quant_format {quant_format!r}"
+
+        # Collected during wrap_modules, one entry per MoE layer in model order.
+        # Each entry maps bank name -> pinned host tensor [num_experts, ...].
+        self._layer_banks: list[dict[str, torch.Tensor]] = []
+        self._num_experts: int | None = None
+        self.cache: ExpertSlotCache | None = None
+
+    def wrap_modules(
+        self,
+        modules_generator: Generator[nn.Module, None, None],
+        prefix: str = "",
+    ) -> list[nn.Module]:
+        """Divert each constructed module's routed expert weights to pinned host."""
+        modules = []
+        for module in modules_generator:
+            self._divert_module(module)
+            modules.append(module)
+        return modules
+
+    def _divert_module(self, module: nn.Module) -> None:
+        # Lazy import to avoid a cycle (offload.routed_experts imports layers).
+        from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
+            OffloadRoutedExperts,
+        )
+
+        for sub in module.modules():
+            if isinstance(sub, OffloadRoutedExperts):
+                self._divert_routed_experts(sub)
+
+    def _divert_routed_experts(self, layer) -> None:
+        """Move this layer's expert weights to pinned host and register them."""
+        if getattr(layer, "_offload_diverted", False):
+            return
+
+        banks: dict[str, torch.Tensor] = {}
+        for bank_name in BANK_SCHEMAS[self.quant_format]:
+            param_name = BANK_TO_PARAM[bank_name]
+            param = getattr(layer, param_name, None)
+            if param is None:
+                raise RuntimeError(
+                    f"expert_cache offload: layer {layer.layer_name!r} has no "
+                    f"{param_name!r}; only unquantized bf16 experts are supported"
+                )
+            host_tensor = self._to_host_bank(param.data)
+            # Keep the parameter object pointing at the pinned host bank so weight
+            # loading fills it directly; mark it so downstream machinery leaves it
+            # on the host.
+            param.data = host_tensor
+            setattr(param, EXPERT_OFFLOADED_ATTR, True)
+            banks[bank_name] = host_tensor
+
+        # Validate a uniform expert count across all offloaded layers.
+        num_experts = int(next(iter(banks.values())).shape[0])
+        if self._num_experts is None:
+            self._num_experts = num_experts
+        elif num_experts != self._num_experts:
+            raise ValueError(
+                "expert_cache offload requires a uniform expert count across "
+                f"MoE layers; got {num_experts} vs {self._num_experts}"
+            )
+
+        layer._offload_diverted = True
+        layer._offload_layer_id = len(self._layer_banks)
+        self._layer_banks.append(banks)
+
+    def _to_host_bank(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Move a weight tensor to (optionally pinned) host memory."""
+        host = tensor.detach().to("cpu")
+        if self.pin_memory:
+            pinned = torch.empty_like(host, pin_memory=True)
+            pinned.copy_(host)
+            host = pinned
+        return host.contiguous()
+
+    def post_init(self) -> None:
+        """Finalize the global slot cache once all layers have registered."""
+        if not self._layer_banks:
+            logger.warning(
+                "expert_cache offload enabled but no offloaded MoE layers were "
+                "found; the slot cache will not be created."
+            )
+            return
+        if self._num_experts is None:
+            return
+
+        num_layers = len(self._layer_banks)
+        # Determine the target device (prefer CUDA if available).
+        from vllm.platforms import current_platform
+
+        device = (
+            torch.device(current_platform.device_type)
+            if current_platform.is_cuda_alike()
+            else torch.device("cpu")
+        )
+
+        cache = ExpertSlotCache(
+            num_layers=num_layers,
+            num_experts=self._num_experts,
+            cache_size=self.cache_size,
+            device=device,
+            quant_format=self.quant_format,
+            pin_memory=self.pin_memory,
+        )
+        # sources[name] -> list of per-layer host tensors.
+        sources: dict[str, list[torch.Tensor]] = {
+            name: [banks[name] for banks in self._layer_banks]
+            for name in BANK_SCHEMAS[self.quant_format]
+        }
+        cache.set_bank_sources(sources)
+        set_global_slot_cache(cache)
+        self.cache = cache
+
+        total = cache.slot_cache_bytes()
+        logger.info(
+            "expert_cache offload: %d MoE layers x %d experts, %d GPU slots "
+            "(%s slot cache), host banks %s",
+            num_layers,
+            self._num_experts,
+            self.cache_size,
+            format_gib(total),
+            "pinned" if self.pin_memory else "pageable",
+        )

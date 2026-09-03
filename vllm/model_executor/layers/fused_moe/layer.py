@@ -85,6 +85,52 @@ def determine_expert_counts(
     return global_num_experts, logical_num_experts, num_fused_shared_experts
 
 
+def _maybe_offload_routed_experts_cls(
+    vllm_config,
+    moe_parallel_config: "FusedMoEParallelConfig",
+    enable_eplb: bool,
+) -> type[RoutedExperts]:
+    """Return the expert-cache offload ``RoutedExperts`` subclass when applicable.
+
+    Selects :class:`OffloadRoutedExperts` when the ``expert_cache`` offload backend
+    is enabled and the deployment is eligible (NVIDIA CUDA, no expert parallelism /
+    EPLB / LoRA). Otherwise returns the default :class:`RoutedExperts`. A quantized
+    MoE method is rejected inside ``OffloadRoutedExperts`` (phase 1 is bf16-only),
+    so quantized models fail loudly rather than silently skipping the offload.
+    """
+    offload_config = getattr(vllm_config, "offload_config", None)
+    if offload_config is None or offload_config.offload_backend != "expert_cache":
+        return RoutedExperts
+
+    if enable_eplb or moe_parallel_config.use_ep or moe_parallel_config.ep_size > 1:
+        logger.warning_once(
+            "expert_cache offload does not support expert parallelism / EPLB; "
+            "falling back to the default (non-offloaded) routed experts."
+        )
+        return RoutedExperts
+    if vllm_config.lora_config is not None:
+        logger.warning_once(
+            "expert_cache offload does not support LoRA; falling back to the "
+            "default (non-offloaded) routed experts."
+        )
+        return RoutedExperts
+
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        logger.warning_once(
+            "expert_cache offload requires an NVIDIA CUDA device; falling back "
+            "to the default (non-offloaded) routed experts."
+        )
+        return RoutedExperts
+
+    from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
+        OffloadRoutedExperts,
+    )
+
+    return OffloadRoutedExperts
+
+
 def FusedMoEFactory(
     num_experts: int,  # Global number of experts
     top_k: int,
@@ -360,7 +406,9 @@ def FusedMoEFactory(
     # Create RoutedExperts instance BEFORE create_weights()
     # This will hold all expert weight parameters
     if routed_experts_cls is None:
-        routed_experts_cls = RoutedExperts
+        routed_experts_cls = _maybe_offload_routed_experts_cls(
+            vllm_config, moe_parallel_config, enable_eplb
+        )
 
     assert params_dtype is not None
     routed_experts = routed_experts_cls(

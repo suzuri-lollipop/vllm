@@ -163,6 +163,11 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
+        # Expert-cache offloaded parameters are pinned host banks by design; they
+        # must stay on the host (moving them to the GPU defeats the offload and can
+        # OOM for MoE models larger than VRAM). Skip them in both directions.
+        if getattr(p, "_vllm_is_expert_offloaded", False):
+            continue
         if p.device.type == "cpu":
             cpu_params.add(name)
             p.data = p.data.to(target_device)
