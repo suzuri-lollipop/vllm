@@ -3,20 +3,30 @@
 """Offload-mode routed experts: host banks + global LRU slot-cache GEMM.
 
 ``OffloadRoutedExperts`` is the ``RoutedExperts`` used when the ``expert_cache``
-offload backend is active. It swaps the quant method for
-``OffloadUnquantizedFusedMoEMethod``, which (a) never moves the expert weights to
-the GPU in ``process_weights_after_loading`` -- they stay as pinned host banks --
-and (b) runs the forward as: ``ensure`` the routed experts into the global slot
-cache (rewriting ``topk_ids`` to slot ids), stream the misses host -> device, then
-execute a standard fused MoE over the slot cache (``cache_size`` local experts).
+offload backend is active. It swaps the quant method for an offload-aware variant:
+
+* unquantized (bf16) -> :class:`OffloadUnquantizedFusedMoEMethod`
+* block-quantized FP8 (``weight_block_size``) -> :class:`OffloadFp8MoEMethod`
+* any other quantization -> loud ``NotImplementedError`` (no silent fallback)
+
+Each offload method (a) never moves the expert weights to the GPU in
+``process_weights_after_loading`` -- they stay as pinned host banks -- and (b) runs
+the forward as: ``ensure`` the routed experts into the global slot cache (rewriting
+``topk_ids`` to slot ids), stream the misses host -> device, then execute a standard
+fused MoE over the slot cache (``cache_size`` local experts) using vLLM's existing
+Triton experts backend.
+
+For FP8 the per-block weight scales are small but are indexed by expert/slot id in
+the GEMM, so they are banked alongside the weights and moved with them; the slot
+GEMM reads the per-slot scale cache (see :class:`OffloadFp8MoEMethod`).
 
 The weight diversion itself happens earlier, in
 :class:`~vllm.model_executor.offloader.expert_cache.ExpertCacheOffloader.wrap_modules`,
 so a MoE model larger than VRAM never holds all experts on the GPU at once.
 
-Prefill handling (phase 1): the slot-cache ``ensure`` path is correct for any
-batch (decode or prefill), so it is the default. When a batch is detected as
-prefill/mixed (query_len > 1 for at least one sequence) the simpler synchronous
+Prefill handling: the slot-cache ``ensure`` path is correct for any batch (decode or
+prefill), so it is the default. When a batch is detected as prefill/mixed
+(query_len > 1 for at least one sequence) the simpler synchronous
 ``materialize_layer`` path is used instead, which stages the whole expert layer at
 once rather than running the per-token LRU ensure loop. Detection is best-effort
 (see :func:`_batch_is_prefill`); when it cannot tell, the always-correct ensure
@@ -32,6 +42,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.offload.slot_cache import (
+    ExpertSlotCache,
     get_global_slot_cache,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -47,6 +58,73 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _offload_forward(
+    method,
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Shared ensure/copy/slot-GEMM forward for every offload quant method.
+
+    ``method`` must provide ``moe_kernel`` (built lazily) and is otherwise agnostic
+    to the element format: the slot weight caches are addressed by name and the
+    per-format scales are already baked into ``method.moe_kernel``'s quant config.
+    """
+    cache = get_global_slot_cache()
+    layer_id = getattr(layer, "_offload_layer_id", None)
+    if layer_id is None:
+        raise RuntimeError(
+            "expert_cache offload: layer was not registered with the expert "
+            "slot cache (was the offloader's wrap_modules run?)"
+        )
+
+    # Lazily build the slot-space GEMM kernel once the slot cache exists. The
+    # build is host-side (no device sync) and happens during the eager warmup that
+    # precedes any CUDA-graph capture.
+    if method.moe_kernel is None:
+        method.build_offload_kernel(layer, cache)
+
+    # The slot ids are int32; match the routing ids before the in-place rewrite.
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    if _batch_is_prefill():
+        # Simple synchronous prefill path: materialize the whole expert layer into
+        # the first num_experts slots (position == expert id) and compute. Routing
+        # ids pass through unmapped.
+        cache.materialize_layer(layer_id)
+        cache.copy_missing()
+        w13 = cache.bank_caches["w13"][: cache.num_experts]
+        w2 = cache.bank_caches["w2"][: cache.num_experts]
+        num_local = cache.num_experts
+    else:
+        # Decode: LRU-ensure the routed experts, streaming only the misses.
+        # ``ensure_experts`` rewrites ``topk_ids`` in place to slot ids.
+        cache.ensure_experts(layer_id, topk_ids)
+        cache.copy_missing()
+        w13 = cache.bank_caches["w13"]
+        w2 = cache.bank_caches["w2"]
+        num_local = cache.cache_size
+
+    assert method.moe_kernel is not None
+    # Shared experts (if any) are executed by the runner; the offload path only
+    # produces the routed output.
+    return method.moe_kernel.apply(
+        hidden_states=x,
+        w1=w13,
+        w2=w2,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        activation=layer.activation,
+        global_num_experts=num_local,
+        expert_map=None,
+        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+
 class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """Unquantized (bf16) MoE method for the expert_cache offload backend.
 
@@ -56,16 +134,23 @@ class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     the slot cache directly).
     """
 
+    offload_quant_format = "bf16"
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        """Build the slot-space GEMM kernel; do NOT move weights to the GPU.
+        """Do NOT move the expert weights to the GPU.
 
         The base implementation shuffles weights into a GPU kernel format, which
         would materialize the full expert tensors in VRAM -- exactly what offload
         avoids. The expert weights remain pinned host banks (registered by the
-        offloader); here we only build the modular kernel used to run the slot
-        cache.
+        offloader); the slot-space GEMM kernel is built lazily by
+        :meth:`build_offload_kernel` once the slot cache exists.
         """
         # Deliberately NOT calling super(): the weights must stay on the host.
+
+    def build_offload_kernel(
+        self, layer: RoutedExperts, cache: ExpertSlotCache
+    ) -> None:
+        """Build the slot-space Triton GEMM kernel (bf16 has no scales)."""
         import vllm.model_executor.layers.fused_moe.modular_kernel as mk
         from vllm.model_executor.layers.fused_moe.all2all_utils import (
             maybe_make_prepare_finalize,
@@ -96,50 +181,92 @@ class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        cache = get_global_slot_cache()
-        layer_id = getattr(layer, "_offload_layer_id", None)
-        if layer_id is None:
-            raise RuntimeError(
-                "expert_cache offload: layer was not registered with the expert "
-                "slot cache (was the offloader's wrap_modules run?)"
+        return _offload_forward(self, layer, x, topk_weights, topk_ids)
+
+
+def _make_offload_fp8_method(base_method):
+    """Build an offload FP8 MoE method from an already-resolved ``Fp8MoEMethod``.
+
+    Defined as a factory (rather than a top-level class) so the ``Fp8MoEMethod``
+    import stays lazy; it reuses the resolved backend selection instead of
+    re-running it.
+    """
+    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+    class OffloadFp8MoEMethod(Fp8MoEMethod):
+        """Block-quantized FP8 MoE method for the expert_cache offload backend.
+
+        Expert weights (float8_e4m3fn) and their per-block float32 scales stay in
+        pinned host banks. The slot-space GEMM uses vLLM's Triton fp8 experts
+        backend; because the kernel indexes the weight scale by expert/slot id, the
+        scales are banked alongside the weights and served from a per-slot scale
+        cache.
+        """
+
+        offload_quant_format = "fp8_block"
+
+        def __init__(self, base: Fp8MoEMethod):
+            # Reuse the resolved Fp8MoEMethod state (quant config, block shape and
+            # backend already selected); do not re-run selection.
+            self.__dict__.update(base.__dict__)
+
+        def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+            """Do NOT move the expert weights/scales to the GPU (see bf16)."""
+            # Deliberately NOT calling the base implementation: the weights and
+            # block scales must stay on the host; the kernel is built lazily.
+
+        def build_offload_kernel(
+            self, layer: RoutedExperts, cache: ExpertSlotCache
+        ) -> None:
+            """Build the slot-space Triton fp8 GEMM kernel over the slot caches.
+
+            The per-slot scale caches are the GEMM's weight scales; they are filled
+            by the fused miss copy whenever an expert (weight rows + scale rows)
+            lands in a slot, so indexing them by slot id matches the rewritten
+            ``topk_ids``.
+            """
+            import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+            from vllm.model_executor.layers.fused_moe.all2all_utils import (
+                maybe_make_prepare_finalize,
+            )
+            from vllm.model_executor.layers.fused_moe.config import (
+                fp8_w8a8_moe_quant_config,
+            )
+            from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+                TritonExperts,
             )
 
-        # The slot ids are int32; match the routing ids before the in-place rewrite.
-        if topk_ids.dtype != torch.int32:
-            topk_ids = topk_ids.to(torch.int32)
+            moe_quant_config = fp8_w8a8_moe_quant_config(
+                w1_scale=cache.bank_caches["w13_scale"],
+                w2_scale=cache.bank_caches["w2_scale"],
+                a1_scale=None,
+                a2_scale=None,
+                block_shape=self.moe_block_shape,
+            )
+            self.moe_quant_config = moe_quant_config
 
-        if _batch_is_prefill():
-            # Simple synchronous prefill path: materialize the whole expert layer
-            # into the first num_experts slots (position == expert id) and compute.
-            # Routing ids pass through unmapped.
-            cache.materialize_layer(layer_id)
-            cache.copy_missing()
-            w13, w2 = cache.bank_views(cache.num_experts)
-            num_local = cache.num_experts
-        else:
-            # Decode: LRU-ensure the routed experts, streaming only the misses.
-            # ``ensure_experts`` rewrites ``topk_ids`` in place to slot ids.
-            cache.ensure_experts(layer_id, topk_ids)
-            cache.copy_missing()
-            w13, w2 = cache.bank_views()
-            num_local = cache.cache_size
+            prepare_finalize = maybe_make_prepare_finalize(
+                moe=self.moe,
+                quant_config=moe_quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            )
+            assert prepare_finalize is not None
+            experts = TritonExperts(moe_config=self.moe, quant_config=moe_quant_config)
+            self.moe_kernel = mk.FusedMoEKernel(prepare_finalize, experts)
 
-        assert self.moe_kernel is not None
-        # Shared experts (if any) are executed by the runner; the offload path only
-        # produces the routed output.
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=w13,
-            w2=w2,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            activation=layer.activation,
-            global_num_experts=num_local,
-            expert_map=None,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            shared_experts=None,
-            shared_experts_input=None,
-        )
+        def apply(
+            self,
+            layer: RoutedExperts,
+            x: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            shared_experts: SharedExperts | None,
+            shared_experts_input: torch.Tensor | None,
+        ) -> torch.Tensor:
+            return _offload_forward(self, layer, x, topk_weights, topk_ids)
+
+    return OffloadFp8MoEMethod(base_method)
 
 
 class OffloadRoutedExperts(RoutedExperts):
@@ -151,18 +278,33 @@ class OffloadRoutedExperts(RoutedExperts):
         quant_config,
         moe_config: FusedMoEConfig,
     ):
-        # Offload only supports the unquantized (bf16) path. If a quant config
-        # resolved to a real MoE method, this subclass should not have been
-        # selected; fail loudly rather than silently computing wrong results.
-        if quant_config is not None:
-            method = quant_config.get_quant_method(self, prefix)
-            if method is not None:
-                raise NotImplementedError(
-                    "expert_cache offload supports unquantized (bf16) MoE experts "
-                    f"only; got a quantized MoE method for {prefix!r}. Disable "
-                    "expert_cache offload or use an unquantized model."
-                )
-        return OffloadUnquantizedFusedMoEMethod(moe_config)
+        # Unquantized (bf16) and block-quantized FP8 are supported; every other
+        # quantization fails loudly rather than silently computing wrong results.
+        if quant_config is None:
+            return OffloadUnquantizedFusedMoEMethod(moe_config)
+
+        method = quant_config.get_quant_method(self, prefix)
+        if method is None:
+            # The model has a quant config but this MoE layer is not quantized.
+            return OffloadUnquantizedFusedMoEMethod(moe_config)
+
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        if isinstance(method, Fp8MoEMethod):
+            if method.block_quant:
+                return _make_offload_fp8_method(method)
+            raise NotImplementedError(
+                "expert_cache offload supports block-quantized FP8 "
+                "(weight_block_size) MoE experts; per-tensor FP8 needs a weight "
+                f"requantization that is not implemented for host banks ({prefix!r}). "
+                "Use a block-quantized checkpoint or disable expert_cache offload."
+            )
+
+        raise NotImplementedError(
+            "expert_cache offload supports unquantized (bf16) and block-quantized "
+            f"FP8 MoE experts only; got {type(method).__name__} for {prefix!r}. "
+            "Disable expert_cache offload. (NVFP4/MXFP4/AWQ are deferred.)"
+        )
 
 
 def _batch_is_prefill() -> bool:

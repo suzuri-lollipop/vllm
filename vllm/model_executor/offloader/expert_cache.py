@@ -56,12 +56,12 @@ class ExpertCacheOffloader(BaseOffloader):
         self,
         cache_size: int,
         pin_memory: bool = True,
-        quant_format: str = "bf16",
     ):
         self.cache_size = cache_size
         self.pin_memory = pin_memory and is_pin_memory_available()
-        self.quant_format = quant_format
-        assert quant_format in BANK_SCHEMAS, f"unknown quant_format {quant_format!r}"
+        # Bank layout, detected from the first diverted layer's quant method
+        # ("bf16" or "fp8_block") and required to be uniform across layers.
+        self.quant_format: str | None = None
 
         # Collected during wrap_modules, one entry per MoE layer in model order.
         # Each entry maps bank name -> pinned host tensor [num_experts, ...].
@@ -91,19 +91,37 @@ class ExpertCacheOffloader(BaseOffloader):
             if isinstance(sub, OffloadRoutedExperts):
                 self._divert_routed_experts(sub)
 
+    @staticmethod
+    def _layer_quant_format(layer) -> str:
+        """Bank layout for this layer, from its offload quant method."""
+        qm = getattr(layer, "quant_method", None)
+        fmt = getattr(qm, "offload_quant_format", None)
+        return fmt or "bf16"
+
     def _divert_routed_experts(self, layer) -> None:
-        """Move this layer's expert weights to pinned host and register them."""
+        """Move this layer's expert weights (and, for fp8, block scales) to pinned
+        host and register them."""
         if getattr(layer, "_offload_diverted", False):
             return
 
+        fmt = self._layer_quant_format(layer)
+        assert fmt in BANK_SCHEMAS, f"unknown offload quant_format {fmt!r}"
+        if self.quant_format is None:
+            self.quant_format = fmt
+        elif self.quant_format != fmt:
+            raise ValueError(
+                "expert_cache offload requires a uniform expert format across "
+                f"MoE layers; got {fmt!r} vs {self.quant_format!r}"
+            )
+
         banks: dict[str, torch.Tensor] = {}
-        for bank_name in BANK_SCHEMAS[self.quant_format]:
+        for bank_name in BANK_SCHEMAS[fmt]:
             param_name = BANK_TO_PARAM[bank_name]
             param = getattr(layer, param_name, None)
             if param is None:
                 raise RuntimeError(
                     f"expert_cache offload: layer {layer.layer_name!r} has no "
-                    f"{param_name!r}; only unquantized bf16 experts are supported"
+                    f"{param_name!r} (bank {bank_name!r}, format {fmt!r})"
                 )
             host_tensor = self._to_host_bank(param.data)
             # Keep the parameter object pointing at the pinned host bank so weight
@@ -146,6 +164,7 @@ class ExpertCacheOffloader(BaseOffloader):
             return
         if self._num_experts is None:
             return
+        assert self.quant_format is not None  # set on first diversion
 
         num_layers = len(self._layer_banks)
         # Determine the target device (prefer CUDA if available).
@@ -176,8 +195,9 @@ class ExpertCacheOffloader(BaseOffloader):
 
         total = cache.slot_cache_bytes()
         logger.info(
-            "expert_cache offload: %d MoE layers x %d experts, %d GPU slots "
-            "(%s slot cache), host banks %s, miss copy %s",
+            "expert_cache offload: format %s, %d MoE layers x %d experts, %d GPU "
+            "slots (%s slot cache), host banks %s, miss copy %s",
+            self.quant_format,
             num_layers,
             self._num_experts,
             self.cache_size,

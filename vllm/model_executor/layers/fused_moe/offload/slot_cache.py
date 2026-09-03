@@ -53,24 +53,31 @@ __all__ = [
 ]
 
 # quant_format -> bank names, in registration order (mirrors FreeToken's
-# _BANK_SCHEMAS). The cache machinery iterates banks in this order; phase 1 only
-# implements dense bf16. Quantized bank layouts (fp8_block / nvfp4 / mxfp4 /
-# ds_fp4 / q4_0) plug in here later, each adding its scale/packed banks.
+# _BANK_SCHEMAS). The cache machinery iterates banks in this order and just moves
+# expert rows, so it is layout-agnostic. Implemented: dense bf16 and
+# block-quantized FP8 (fp8 weight rows + their per-block float32 scale rows).
+# Other quantized layouts (nvfp4 / mxfp4 / ds_fp4 / q4_0) plug in here later.
 BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # dense bf16 expert weights: fused gate_up (w13) + down (w2)
     "bf16": ("w13", "w2"),
-    # future (out of scope, phase 1):
-    # "fp8_block": ("w13", "w13_scale", "w2", "w2_scale"),
+    # block-quantized FP8: fp8 weight rows + per-block scale rows. The scales are
+    # small but are indexed by expert/slot id in the GEMM, so they move with the
+    # weights (banked per row) to stay aligned with the slot cache.
+    "fp8_block": ("w13", "w2", "w13_scale", "w2_scale"),
+    # future (out of scope):
     # "nvfp4": ("w13_packed", "w13_scale", "w13_global", "w2_packed",
     #           "w2_scale", "w2_global"),
     # "mxfp4": ("w13_blocks", "w13_scales", "w13_bias", "w2_blocks",
     #           "w2_scales", "w2_bias"),
 }
 
-# bank name -> the RoutedExperts parameter it is diverted from (bf16 only).
+# bank name -> the RoutedExperts parameter it is diverted from.
 BANK_TO_PARAM: dict[str, str] = {
     "w13": "w13_weight",
     "w2": "w2_weight",
+    # block-quantized FP8 scale tensors (name built as w{13,2}_weight_scale_inv)
+    "w13_scale": "w13_weight_scale_inv",
+    "w2_scale": "w2_weight_scale_inv",
 }
 
 

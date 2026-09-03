@@ -94,9 +94,10 @@ def _maybe_offload_routed_experts_cls(
 
     Selects :class:`OffloadRoutedExperts` when the ``expert_cache`` offload backend
     is enabled and the deployment is eligible (NVIDIA CUDA, no expert parallelism /
-    EPLB / LoRA). Otherwise returns the default :class:`RoutedExperts`. A quantized
-    MoE method is rejected inside ``OffloadRoutedExperts`` (phase 1 is bf16-only),
-    so quantized models fail loudly rather than silently skipping the offload.
+    EPLB / LoRA). Otherwise returns the default :class:`RoutedExperts`. The final
+    format decision lives in ``OffloadRoutedExperts._get_quant_method``: unquantized
+    (bf16) and block-quantized FP8 experts are supported; every other quantization
+    fails loudly rather than silently skipping the offload.
     """
     offload_config = getattr(vllm_config, "offload_config", None)
     if offload_config is None or offload_config.offload_backend != "expert_cache":

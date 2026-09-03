@@ -16,6 +16,8 @@ unavailable.
 Run `pytest tests/kernels/moe/test_moe_expert_offload.py`.
 """
 
+import types
+
 import pytest
 import torch
 import torch.nn as nn
@@ -772,3 +774,263 @@ def test_triton_fused_copy_matches_cpu_reference():
                 )
             else:
                 assert torch.all(c[slot] == -999.0), (name, slot)
+
+
+# ---------------------------------------------------------------------------
+# FP8 (block-quantized) expert banks
+# ---------------------------------------------------------------------------
+
+FP8 = torch.float8_e4m3fn
+FP8_BLOCK = 8  # small block divisor so scale rows stay 16-byte aligned in tests
+
+
+def _make_moe_config():
+    """Minimal FusedMoEConfig for constructing Fp8MoEMethod on CPU."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+
+    pc = FusedMoEParallelConfig(
+        tp_size=1,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        tp_rank=0,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=False,
+        all2all_backend="naive",
+        enable_eplb=False,
+    )
+    return FusedMoEConfig(
+        num_experts=8,
+        experts_per_token=2,
+        hidden_dim=16,
+        intermediate_size=32,
+        num_local_experts=8,
+        num_logical_experts=8,
+        activation=MoEActivation.SILU,
+        device="cpu",
+        routing_method=RoutingMethodType.Default,
+        moe_parallel_config=pc,
+        in_dtype=torch.bfloat16,
+    )
+
+
+def _fp8_bank_shapes(num_experts, hidden=16, inter=24, blk=FP8_BLOCK):
+    return {
+        "w13": (num_experts, 2 * inter, hidden),
+        "w2": (num_experts, hidden, inter),
+        "w13_scale": (num_experts, (2 * inter) // blk, hidden // blk),
+        "w2_scale": (num_experts, hidden // blk, inter // blk),
+    }
+
+
+def _make_fp8_cache(num_experts=4, cache_size=4):
+    shapes = _fp8_bank_shapes(num_experts)
+    dtypes = {
+        "w13": FP8,
+        "w2": FP8,
+        "w13_scale": torch.float32,
+        "w2_scale": torch.float32,
+    }
+    cache = ExpertSlotCache(
+        num_layers=1,
+        num_experts=num_experts,
+        cache_size=cache_size,
+        device=CPU,
+        quant_format="fp8_block",
+    )
+    sources = {n: [torch.zeros(shapes[n], dtype=dtypes[n])] for n in cache.bank_schema}
+    cache.set_bank_sources(sources)
+    return cache
+
+
+def test_fp8_bank_schema_and_param_mapping():
+    assert BANK_SCHEMAS["fp8_block"] == ("w13", "w2", "w13_scale", "w2_scale")
+    from vllm.model_executor.layers.fused_moe.offload.slot_cache import BANK_TO_PARAM
+
+    assert BANK_TO_PARAM["w13_scale"] == "w13_weight_scale_inv"
+    assert BANK_TO_PARAM["w2_scale"] == "w2_weight_scale_inv"
+
+
+def test_fp8_bank_geometry_bytes():
+    cache = _make_fp8_cache(num_experts=4, cache_size=4)
+    hidden, inter = 16, 24
+    blk = FP8_BLOCK
+    # 1 byte/elem for fp8 weights, 4 bytes/elem for fp32 scales.
+    w13_row = 2 * inter * hidden * 1
+    w2_row = hidden * inter * 1
+    s13_row = ((2 * inter) // blk) * (hidden // blk) * 4
+    s2_row = (hidden // blk) * (inter // blk) * 4
+    assert cache.bytes_per_slot() == w13_row + w2_row + s13_row + s2_row
+    assert cache.slot_cache_bytes() == 4 * cache.bytes_per_slot()
+    # The fp8 slot weight caches hold 1-byte elements.
+    assert cache.bank_caches["w13"].dtype == FP8
+    assert cache.bank_caches["w2"].dtype == FP8
+    assert cache.bank_caches["w13_scale"].dtype == torch.float32
+
+
+class _MockQuantConfig:
+    def __init__(self, method):
+        self._method = method
+
+    def get_quant_method(self, layer, prefix):
+        return self._method
+
+
+def _make_fp8_method(block: bool):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+    cfg = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128] if block else None,
+    )
+
+    class _Layer:
+        pass
+
+    layer = _Layer()
+    layer.moe_config = _make_moe_config()
+    return Fp8MoEMethod(cfg, layer)
+
+
+def test_routing_unquantized_format_marker():
+    """The bf16 branch is the phase-1 default; constructing the CustomOp-derived
+    method needs a live vllm config + platform, so assert the format marker here
+    and cover the branch shape (quant_config is None -> bf16 method)."""
+    from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
+        OffloadUnquantizedFusedMoEMethod,
+    )
+
+    assert OffloadUnquantizedFusedMoEMethod.offload_quant_format == "bf16"
+
+
+def test_routing_accepts_block_fp8():
+    from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
+        OffloadRoutedExperts,
+    )
+
+    method = _make_fp8_method(block=True)
+    qc = _MockQuantConfig(method)
+    m = OffloadRoutedExperts._get_quant_method(
+        object.__new__(OffloadRoutedExperts), "x", qc, _make_moe_config()
+    )
+    assert getattr(m, "offload_quant_format", None) == "fp8_block"
+    assert m.moe_block_shape == [128, 128]
+
+
+def test_routing_rejects_pertensor_fp8_loudly():
+    from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
+        OffloadRoutedExperts,
+    )
+
+    method = _make_fp8_method(block=False)
+    qc = _MockQuantConfig(method)
+    with pytest.raises(NotImplementedError, match="block-quantized FP8"):
+        OffloadRoutedExperts._get_quant_method(
+            object.__new__(OffloadRoutedExperts), "x", qc, _make_moe_config()
+        )
+
+
+def test_routing_rejects_other_quant_loudly():
+    from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
+        OffloadRoutedExperts,
+    )
+
+    class _OtherMethod:
+        pass
+
+    qc = _MockQuantConfig(_OtherMethod())
+    with pytest.raises(NotImplementedError, match="NVFP4/MXFP4/AWQ"):
+        OffloadRoutedExperts._get_quant_method(
+            object.__new__(OffloadRoutedExperts), "x", qc, _make_moe_config()
+        )
+
+
+class _FakeFp8RoutedExperts(nn.Module):
+    def __init__(self, num_experts):
+        super().__init__()
+        self.layer_name = "model.layers.0.mlp.experts.routed_experts"
+        shapes = _fp8_bank_shapes(num_experts)
+        self.w13_weight = nn.Parameter(
+            torch.zeros(shapes["w13"], dtype=FP8), requires_grad=False
+        )
+        self.w2_weight = nn.Parameter(
+            torch.zeros(shapes["w2"], dtype=FP8), requires_grad=False
+        )
+        self.w13_weight_scale_inv = nn.Parameter(
+            torch.zeros(shapes["w13_scale"], dtype=torch.float32), requires_grad=False
+        )
+        self.w2_weight_scale_inv = nn.Parameter(
+            torch.zeros(shapes["w2_scale"], dtype=torch.float32), requires_grad=False
+        )
+        self.quant_method = types.SimpleNamespace(offload_quant_format="fp8_block")
+
+
+def test_offloader_diverts_fp8_weights_and_scales():
+    off = ExpertCacheOffloader(cache_size=CACHE_SIZE, pin_memory=False)
+    layer = _FakeFp8RoutedExperts(NUM_EXPERTS)
+    off._divert_routed_experts(layer)
+    assert off.quant_format == "fp8_block"
+    assert set(off._layer_banks[0]) == {"w13", "w2", "w13_scale", "w2_scale"}
+    for name in ("w13_weight", "w2_weight"):
+        p = getattr(layer, name)
+        assert p.device.type == "cpu"
+        assert getattr(p, "_vllm_is_expert_offloaded", False)
+    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        p = getattr(layer, name)
+        assert p.device.type == "cpu"
+        assert getattr(p, "_vllm_is_expert_offloaded", False)
+
+
+def test_offloader_rejects_mixed_formats():
+    off = ExpertCacheOffloader(cache_size=CACHE_SIZE, pin_memory=False)
+    off._divert_routed_experts(_FakeFp8RoutedExperts(NUM_EXPERTS))
+    # A bf16 layer after an fp8 layer must be rejected.
+    bf16_layer = _FakeRoutedExperts(NUM_EXPERTS)
+    with pytest.raises(ValueError, match="uniform expert format"):
+        off._divert_routed_experts(bf16_layer)
+
+
+def test_fp8_fused_copy_plan_none_on_cpu_but_schema_ok():
+    cache = _make_fp8_cache(num_experts=4, cache_size=4)
+    # No CUDA device -> no fused plan; the schema itself is still registered.
+    assert cache._fused_plan is None
+    assert cache.bank_schema == BANK_SCHEMAS["fp8_block"]
+
+
+@pytest.mark.skipif(not _CUDA_AND_TRITON, reason="requires CUDA + Triton")
+def test_fp8_fused_copy_plan_built_on_cuda():
+    # hidden=32, inter=32 -> every bank row (incl. the fp32 scale rows) is a
+    # multiple of 16 bytes, so the fused plan builds.
+    num_experts = 4
+    cache = ExpertSlotCache(
+        num_layers=1,
+        num_experts=num_experts,
+        cache_size=num_experts,
+        device=torch.device("cuda"),
+        quant_format="fp8_block",
+    )
+    shapes = _fp8_bank_shapes(num_experts, hidden=32, inter=32)
+    dtypes = {
+        "w13": FP8,
+        "w2": FP8,
+        "w13_scale": torch.float32,
+        "w2_scale": torch.float32,
+    }
+    sources = {
+        n: [torch.zeros(shapes[n], dtype=dtypes[n]).pin_memory()]
+        for n in cache.bank_schema
+    }
+    cache.set_bank_sources(sources)
+    plan = cache._fused_plan
+    assert plan is not None
+    assert plan.num_banks == 4
+    assert sorted(plan.feat_bytes.tolist()) == sorted(cache.bank_row_bytes().values())
