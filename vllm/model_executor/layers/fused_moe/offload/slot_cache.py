@@ -54,9 +54,11 @@ __all__ = [
 
 # quant_format -> bank names, in registration order (mirrors FreeToken's
 # _BANK_SCHEMAS). The cache machinery iterates banks in this order and just moves
-# expert rows, so it is layout-agnostic. Implemented: dense bf16 and
-# block-quantized FP8 (fp8 weight rows + their per-block float32 scale rows).
-# Other quantized layouts (nvfp4 / mxfp4 / ds_fp4 / q4_0) plug in here later.
+# expert rows, so it is layout-agnostic. Implemented: dense bf16, block-quantized
+# FP8 (fp8 weight rows + their per-block float32 scale rows), and NVFP4/CUTLASS
+# (packed fp4 weight rows + per-block fp8 scale rows + the two per-expert scalar
+# rows the CUTLASS kernel reads every forward -- see the "nvfp4" comment below).
+# Other quantized layouts (mxfp4 / ds_fp4 / q4_0) plug in here later.
 BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # dense bf16 expert weights: fused gate_up (w13) + down (w2)
     "bf16": ("w13", "w2"),
@@ -64,9 +66,49 @@ BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # small but are indexed by expert/slot id in the GEMM, so they move with the
     # weights (banked per row) to stay aligned with the slot cache.
     "fp8_block": ("w13", "w2", "w13_scale", "w2_scale"),
+    # NVFP4 (VLLM_CUTLASS backend only -- see routed_experts.py). Banks:
+    #   w13/w2:            packed fp4 weight rows (uint8, 2 items/byte)
+    #   w13_qscale/w2_qscale:   per-block (group_size=16) fp8_e4m3 scale rows,
+    #       already swizzled into the CUTLASS block-scale layout
+    #   w13_gscale2/w2_gscale2: per-expert scalar "alpha" rows (weight_scale_2
+    #       fused with the activation input_scale by
+    #       CutlassExpertsFp4.process_weights_after_loading, so the GEMM's
+    #       output-dequant alpha travels with the expert row as-is)
+    #   a13_gscale/a2_gscale:   per-expert scalar rows holding the
+    #       RECIPROCAL of the activation quant scale (1 / input_scale), i.e.
+    #       exactly the value CutlassExpertsFp4.apply() reads as `a1_gscale`/
+    #       `a2_gscale` every forward. The reciprocal has to be baked into the
+    #       bank's resting content (computed once per expert at conversion
+    #       time) rather than taken from the raw scale at kernel-build time:
+    #       the slot cache is a shared, mutable buffer, so a `1.0 / bank`
+    #       computed once at build time would freeze in whatever expert
+    #       happened to occupy that slot at that moment instead of following
+    #       later slot swaps.
+    "nvfp4": (
+        "w13",
+        "w13_qscale",
+        "w13_gscale2",
+        "a13_gscale",
+        "w2",
+        "w2_qscale",
+        "w2_gscale2",
+        "a2_gscale",
+    ),
+    # NVFP4 EMULATION backend: weights/block-scales are banked exactly as
+    # loaded (never repacked -- the Triton kernel dequantizes on the fly), so
+    # no a{13,2}_gscale banks: EMULATION's conversion collapses the
+    # activation scale to one global scalar (not per-expert), which stays a
+    # small, non-banked layer attribute instead (see
+    # OffloadModelOptNvfp4MoEMethod._process_weights_emulation).
+    "nvfp4_emulation": (
+        "w13",
+        "w13_qscale",
+        "w13_gscale2",
+        "w2",
+        "w2_qscale",
+        "w2_gscale2",
+    ),
     # future (out of scope):
-    # "nvfp4": ("w13_packed", "w13_scale", "w13_global", "w2_packed",
-    #           "w2_scale", "w2_global"),
     # "mxfp4": ("w13_blocks", "w13_scales", "w13_bias", "w2_blocks",
     #           "w2_scales", "w2_bias"),
 }
@@ -78,6 +120,13 @@ BANK_TO_PARAM: dict[str, str] = {
     # block-quantized FP8 scale tensors (name built as w{13,2}_weight_scale_inv)
     "w13_scale": "w13_weight_scale_inv",
     "w2_scale": "w2_weight_scale_inv",
+    # NVFP4 (ModelOpt/CUTLASS naming; see the "nvfp4" schema comment above)
+    "w13_qscale": "w13_weight_scale",
+    "w13_gscale2": "w13_weight_scale_2",
+    "a13_gscale": "w13_input_scale",
+    "w2_qscale": "w2_weight_scale",
+    "w2_gscale2": "w2_weight_scale_2",
+    "a2_gscale": "w2_input_scale",
 }
 
 

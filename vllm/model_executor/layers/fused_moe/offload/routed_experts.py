@@ -7,6 +7,8 @@ offload backend is active. It swaps the quant method for an offload-aware varian
 
 * unquantized (bf16) -> :class:`OffloadUnquantizedFusedMoEMethod`
 * block-quantized FP8 (``weight_block_size``) -> :class:`OffloadFp8MoEMethod`
+* NVFP4 on the VLLM_CUTLASS backend -> the class built by
+  :func:`_make_offload_nvfp4_method`
 * any other quantization -> loud ``NotImplementedError`` (no silent fallback)
 
 Each offload method (a) never moves the expert weights to the GPU in
@@ -49,6 +51,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
@@ -155,7 +158,37 @@ def _offload_forward(
     return out
 
 
-class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+class _CpuCreateWeightsMixin:
+    """Allocates this layer's expert params directly on the host, never the GPU.
+
+    Mixed in ahead of the base quant method (MRO-first) so ``create_weights``
+    runs under a CPU device context before falling through to the base
+    implementation's ``torch.empty(...)`` calls.
+
+    Without this, a many-expert MoE layer (this project's Qwen4Exp/qwen4_exp
+    checkpoints run 512 experts/layer over 48 layers) can transiently exceed
+    a GPU memory ceiling on this project's WSL2/WDDM host well below the
+    physical VRAM total -- confirmed on real hardware via ``nvidia-smi``: the
+    CUDA "out of memory" error fired during
+    :meth:`~vllm.model_executor.offloader.expert_cache.ExpertCacheOffloader._to_host_bank`
+    with only a few GiB actually resident, and neither
+    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments`` nor an explicit
+    ``torch.cuda.empty_cache()`` after every layer's diversion changed the
+    failure point -- pointing at a WSL2 paravirtualized-GPU (``/dev/dxg``)
+    per-process commit limit rather than allocator fragmentation or genuine
+    VRAM exhaustion. Constructing directly on the host sidesteps the GPU for
+    this step entirely; :class:`~vllm.model_executor.offloader.expert_cache.ExpertCacheOffloader`'s
+    diversion/pinning bookkeeping is unaffected since it already treats the
+    incoming tensor as arbitrary source data (``_to_host_bank``'s ``.to("cpu")``
+    becomes a no-op).
+    """
+
+    def create_weights(self, layer: RoutedExperts, *args, **kwargs) -> None:
+        with torch.device("cpu"):
+            super().create_weights(layer, *args, **kwargs)
+
+
+class OffloadUnquantizedFusedMoEMethod(_CpuCreateWeightsMixin, UnquantizedFusedMoEMethod):
     """Unquantized (bf16) MoE method for the expert_cache offload backend.
 
     Expert weights stay in pinned host memory; the GEMM runs over the global GPU
@@ -214,6 +247,320 @@ class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return _offload_forward(self, layer, x, topk_weights, topk_ids)
 
 
+def _make_offload_nvfp4_method(base_method):
+    """Build an offload NVFP4 MoE method from an already-resolved
+    ``ModelOptNvFp4FusedMoE`` (restricted to the VLLM_CUTLASS backend; see the
+    class docstring).
+
+    Defined as a factory (rather than a top-level class) so the ModelOpt import
+    stays lazy, mirroring :func:`_make_offload_fp8_method`.
+    """
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+
+    class OffloadModelOptNvfp4MoEMethod(_CpuCreateWeightsMixin, ModelOptNvFp4FusedMoE):
+        """NVFP4 MoE method for the expert_cache offload backend.
+
+        Two NVFP4 kernel backends are supported, each with its own bank
+        schema (see slot_cache.BANK_SCHEMAS["nvfp4"] / ["nvfp4_emulation"]):
+
+        * VLLM_CUTLASS: post-conversion per-expert tensors (weights, block
+          scales, and two per-expert scalar scale rows) keep a leading
+          ``num_experts`` dimension with no cross-expert mixing
+          (``swizzle_blockscale`` only reshapes the block/K dimensions), so a
+          whole expert row can be banked and slot-swapped independently.
+          Needs a transient GPU round trip to convert (below).
+        * EMULATION: weights/block-scales are never repacked at all (the
+          Triton kernel dequantizes on the fly), so only the two per-expert
+          weight_scale_2 rows need banking; the activation scale collapses to
+          a single global scalar (not per-expert) and is never banked.
+
+        Other NVFP4 backends (FlashInfer TRT-LLM/CuteDSL, Marlin, Humming)
+        repack weights into batched/grouped-GEMM buffers or bake a layer-wide
+        shared scale factor across ALL experts at conversion time, which is
+        not safe to reason about per-expert -- they are rejected rather than
+        silently mishandled.
+
+        The class name must contain "ModelOpt":
+        ``RoutedExperts.weight_loader`` (vllm/model_executor/layers/fused_moe/routed_experts.py)
+        branches on ``self.quant_method.__class__.__name__`` containing that
+        substring to pick the ModelOpt-specific weight_scale_2/input_scale
+        loading path; naming this class e.g. "OffloadNvfp4MoEMethod" makes
+        every one of those checks silently miss and fall through to the
+        generic (wrong) loader, confirmed on real hardware as a late
+        ``ValueError: quant method must be one of [...]`` deep in weight
+        loading -- long after this class's own code has already run
+        correctly, which is what made it look unrelated to the class name.
+        """
+
+        _CUTLASS_BANKED_PARAMS = (
+            "w13_weight",
+            "w13_weight_scale",
+            "w13_weight_scale_2",
+            "w13_input_scale",
+            "w2_weight",
+            "w2_weight_scale",
+            "w2_weight_scale_2",
+            "w2_input_scale",
+        )
+        _EMULATION_BANKED_PARAMS = (
+            "w13_weight",
+            "w13_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight",
+            "w2_weight_scale",
+            "w2_weight_scale_2",
+        )
+
+        def __init__(self, base: ModelOptNvFp4FusedMoE):
+            # Reuse the resolved ModelOptNvFp4FusedMoE state (backend already
+            # selected); do not re-run selection.
+            self.__dict__.update(base.__dict__)
+            if self.nvfp4_backend not in (
+                NvFp4MoeBackend.VLLM_CUTLASS,
+                NvFp4MoeBackend.EMULATION,
+            ):
+                raise NotImplementedError(
+                    "expert_cache offload supports NVFP4 MoE experts only "
+                    "with the VLLM_CUTLASS or EMULATION backend (per-expert "
+                    f"rows stay independently sliceable); got "
+                    f"{self.nvfp4_backend.value!r}. Pass --moe-backend cutlass "
+                    "(or 'emulation') to select one explicitly, or disable "
+                    "expert_cache offload."
+                )
+            if self.use_a16:
+                raise NotImplementedError(
+                    "expert_cache offload does not support W4A16 NVFP4 "
+                    "checkpoints; disable expert_cache offload."
+                )
+            self.offload_quant_format = (
+                "nvfp4"
+                if self.nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
+                else "nvfp4_emulation"
+            )
+
+        def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+            if self.nvfp4_backend == NvFp4MoeBackend.EMULATION:
+                self._process_weights_emulation(layer)
+            else:
+                self._process_weights_cutlass(layer)
+
+        def _process_weights_cutlass(self, layer: RoutedExperts) -> None:
+            """Convert on a transient GPU copy; keep only the result on the host.
+
+            The banked params were diverted to pinned host memory at
+            construction time (before the checkpoint was loaded), so they
+            hold real loaded values here but live on the host. They are
+            copied to the GPU, converted via the ordinary (unmodified)
+            ModelOpt/CUTLASS path -- which also fuses the activation scale
+            into ``w{13,2}_weight_scale_2`` in place
+            (``CutlassExpertsFp4.process_weights_after_loading``) -- and then
+            copied back into fresh pinned host tensors. The throwaway kernel
+            ``super()`` builds (bound to the transient GPU tensors) is
+            discarded; a real one is built lazily in
+            :meth:`build_offload_kernel` once the slot cache exists.
+            """
+            device = torch.device(
+                current_platform.device_type, torch.cuda.current_device()
+            )
+            for name in self._CUTLASS_BANKED_PARAMS:
+                param = getattr(layer, name)
+                param.data = param.data.to(device=device, non_blocking=True)
+
+            super().process_weights_after_loading(layer)
+
+            # `a{13,2}_gscale` bank rows must hold the RECIPROCAL of the
+            # activation scale (see slot_cache.py): the slot cache is a
+            # shared, mutable buffer, so the reciprocal has to be baked in
+            # once per expert now, not recomputed from whatever expert
+            # happens to occupy a slot at kernel-build time.
+            layer.w13_input_scale.data = 1.0 / layer.w13_input_scale.data
+            layer.w2_input_scale.data = 1.0 / layer.w2_input_scale.data
+
+            from vllm.model_executor.offloader.base import get_offloader
+
+            # Match the offloader's configured pin_memory (--moe-cache-pin-memory),
+            # not a bare platform check: on this project's WSL2/WDDM host, pinned
+            # allocation has its own ceiling well below both VRAM and host RAM
+            # (confirmed on real hardware), so a user who disabled it for
+            # ExpertCacheOffloader needs it disabled here too.
+            pin = get_offloader().pin_memory
+            for name in self._CUTLASS_BANKED_PARAMS:
+                param = getattr(layer, name)
+                host = torch.empty_like(param.data, device="cpu", pin_memory=pin)
+                host.copy_(param.data)
+                param.data = host
+            # Force a lazy rebuild against the slot cache; the kernel/config
+            # built by super() above referenced the transient GPU tensors.
+            self.moe_kernel = None
+            self.moe_quant_config = None
+
+            # The conversion above (super().process_weights_after_loading)
+            # materializes every banked tensor for this layer's 512 experts on
+            # the GPU at once (plus CUTLASS's own padding/reorder scratch);
+            # release it back to the allocator now rather than letting it
+            # accumulate into the next layer's conversion -- confirmed on real
+            # hardware as a genuine (not fragmentation-only) transient peak.
+            torch.cuda.empty_cache()
+
+        def _process_weights_emulation(self, layer: RoutedExperts) -> None:
+            """Collapse two scalars on the host; nothing else needs converting.
+
+            EMULATION repacks nothing -- weights/block-scales are banked
+            exactly as loaded -- so the only real work
+            ``ModelOptNvFp4FusedMoE.process_weights_after_loading`` does for
+            this backend is: collapse ``w13_weight_scale_2`` from its
+            checkpoint ``[E, 2]`` shard shape to ``[E]``, and collapse each of
+            ``w{13,2}_input_scale`` to a single global scalar
+            (``1 / max(input_scale)``). Both are ordinary CPU tensor ops
+            (unlike CUTLASS's ``swizzle_blockscale``, which calls ``.cuda()``
+            unconditionally), so this never touches the GPU.
+
+            Deliberately NOT calling ``super()``: its full path builds a
+            throwaway kernel/experts object to run this same conversion,
+            which for ``Nvfp4QuantizationEmulationTritonExperts`` captures
+            ``self.w1_scale_val``/``self.w2_scale_val`` as instance attributes
+            referencing this layer's (GPU-resident, had it been staged there)
+            banks -- confirmed on real hardware as VRAM accumulating across
+            the 48-layer conversion loop until OOM, because those references
+            outlive `self.moe_kernel = None` in ways not fully tracked down.
+            Skipping super() entirely (mirroring bf16/fp8_block) sidesteps
+            the whole class of leak by construction: nothing is ever staged
+            on the GPU here for anything to hold onto.
+            """
+            if self.moe.is_act_and_mul and not torch.allclose(
+                layer.w13_weight_scale_2.data[:, 0], layer.w13_weight_scale_2.data[:, 1]
+            ):
+                logger.warning_once(
+                    "w1_weight_scale_2 must match w3_weight_scale_2. "
+                    "Accuracy may be affected."
+                )
+            layer.w13_weight_scale_2.data = layer.w13_weight_scale_2.data[
+                :, 0
+            ].contiguous()
+            layer.w13_input_scale.data = (
+                1.0 / layer.w13_input_scale.data.max().to(torch.float32)
+            ).reshape(())
+            layer.w2_input_scale.data = (
+                1.0 / layer.w2_input_scale.data.max().to(torch.float32)
+            ).reshape(())
+            self.moe_kernel = None
+            self.moe_quant_config = None
+
+        def build_offload_kernel(
+            self, layer: RoutedExperts, cache: ExpertSlotCache
+        ) -> None:
+            if self.nvfp4_backend == NvFp4MoeBackend.EMULATION:
+                self._build_offload_kernel_emulation(layer, cache)
+            else:
+                self._build_offload_kernel_cutlass(layer, cache)
+
+        def _build_offload_kernel_cutlass(
+            self, layer: RoutedExperts, cache: ExpertSlotCache
+        ) -> None:
+            """Build the slot-space CUTLASS FP4 GEMM kernel over the slot caches."""
+            import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+            from vllm.model_executor.layers.fused_moe.all2all_utils import (
+                maybe_make_prepare_finalize,
+            )
+            from vllm.model_executor.layers.fused_moe.config import (
+                nvfp4_moe_quant_config,
+            )
+            from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+                CutlassExpertsFp4,
+            )
+
+            # Bypass make_nvfp4_moe_quant_config's own `1.0 / a_scale`: the
+            # a{13,2}_gscale banks already hold the reciprocal (see
+            # _process_weights_cutlass), and everything below is a direct
+            # reference into the slot cache's live GPU buffers so later slot
+            # swaps are picked up automatically, exactly like
+            # OffloadFp8MoEMethod's w{13,2}_scale banks.
+            moe_quant_config = nvfp4_moe_quant_config(
+                g1_alphas=cache.bank_caches["w13_gscale2"],
+                g2_alphas=cache.bank_caches["w2_gscale2"],
+                a1_gscale=cache.bank_caches["a13_gscale"],
+                a2_gscale=cache.bank_caches["a2_gscale"],
+                w1_scale=cache.bank_caches["w13_qscale"],
+                w2_scale=cache.bank_caches["w2_qscale"],
+                is_scale_swizzled=True,
+                gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+                gemm1_beta=getattr(layer, "swiglu_beta", None),
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+            )
+            self.moe_quant_config = moe_quant_config
+
+            prepare_finalize = maybe_make_prepare_finalize(
+                moe=self.moe,
+                quant_config=moe_quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            )
+            assert prepare_finalize is not None
+            experts = CutlassExpertsFp4(moe_config=self.moe, quant_config=moe_quant_config)
+            self.moe_kernel = mk.FusedMoEKernel(prepare_finalize, experts)
+
+        def _build_offload_kernel_emulation(
+            self, layer: RoutedExperts, cache: ExpertSlotCache
+        ) -> None:
+            """Build the slot-space Triton dequant+GEMM kernel over the slot caches."""
+            import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+            from vllm.model_executor.layers.fused_moe.all2all_utils import (
+                maybe_make_prepare_finalize,
+            )
+            from vllm.model_executor.layers.fused_moe.config import (
+                nvfp4_moe_quant_config,
+            )
+            from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
+                Nvfp4QuantizationEmulationTritonExperts,
+            )
+
+            # w{13,2}_input_scale are two host-resident scalars (collapsed by
+            # _process_weights_emulation, never staged on the GPU there to
+            # avoid the leak that method's docstring explains); this lazy,
+            # one-time, one-layer move is too small to matter.
+            layer.w13_input_scale.data = layer.w13_input_scale.data.to(cache.device)
+            layer.w2_input_scale.data = layer.w2_input_scale.data.to(cache.device)
+            moe_quant_config = nvfp4_moe_quant_config(
+                g1_alphas=cache.bank_caches["w13_gscale2"],
+                g2_alphas=cache.bank_caches["w2_gscale2"],
+                a1_gscale=layer.w13_input_scale,
+                a2_gscale=layer.w2_input_scale,
+                w1_scale=cache.bank_caches["w13_qscale"],
+                w2_scale=cache.bank_caches["w2_qscale"],
+                is_scale_swizzled=False,
+                gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+                gemm1_beta=getattr(layer, "swiglu_beta", None),
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+            )
+            self.moe_quant_config = moe_quant_config
+
+            prepare_finalize = maybe_make_prepare_finalize(
+                moe=self.moe,
+                quant_config=moe_quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            )
+            assert prepare_finalize is not None
+            experts = Nvfp4QuantizationEmulationTritonExperts(
+                moe_config=self.moe, quant_config=moe_quant_config
+            )
+            self.moe_kernel = mk.FusedMoEKernel(prepare_finalize, experts)
+
+        def apply(
+            self,
+            layer: RoutedExperts,
+            x: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            shared_experts: SharedExperts | None,
+            shared_experts_input: torch.Tensor | None,
+        ) -> torch.Tensor:
+            return _offload_forward(self, layer, x, topk_weights, topk_ids)
+
+    return OffloadModelOptNvfp4MoEMethod(base_method)
+
+
 def _make_offload_fp8_method(base_method):
     """Build an offload FP8 MoE method from an already-resolved ``Fp8MoEMethod``.
 
@@ -223,7 +570,7 @@ def _make_offload_fp8_method(base_method):
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 
-    class OffloadFp8MoEMethod(Fp8MoEMethod):
+    class OffloadFp8MoEMethod(_CpuCreateWeightsMixin, Fp8MoEMethod):
         """Block-quantized FP8 MoE method for the expert_cache offload backend.
 
         Expert weights (float8_e4m3fn) and their per-block float32 scales stay in
@@ -330,10 +677,20 @@ class OffloadRoutedExperts(RoutedExperts):
                 "Use a block-quantized checkpoint or disable expert_cache offload."
             )
 
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptNvFp4FusedMoE,
+        )
+
+        if isinstance(method, ModelOptNvFp4FusedMoE):
+            # _make_offload_nvfp4_method itself rejects any backend other than
+            # VLLM_CUTLASS (and W4A16 checkpoints) with a NotImplementedError.
+            return _make_offload_nvfp4_method(method)
+
         raise NotImplementedError(
-            "expert_cache offload supports unquantized (bf16) and block-quantized "
-            f"FP8 MoE experts only; got {type(method).__name__} for {prefix!r}. "
-            "Disable expert_cache offload. (NVFP4/MXFP4/AWQ are deferred.)"
+            "expert_cache offload supports unquantized (bf16), block-quantized "
+            "FP8, and NVFP4 (VLLM_CUTLASS backend) MoE experts only; got "
+            f"{type(method).__name__} for {prefix!r}. Disable expert_cache "
+            "offload. (Compressed-tensors NVFP4, MXFP4, AWQ are deferred.)"
         )
 
 

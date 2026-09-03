@@ -117,7 +117,7 @@ class ExpertCacheOffloader(BaseOffloader):
                 f"MoE layers; got {fmt!r} vs {self.quant_format!r}"
             )
 
-        banks: dict[str, torch.Tensor] = {}
+        banks: dict[str, nn.Parameter] = {}
         for bank_name in BANK_SCHEMAS[fmt]:
             param_name = BANK_TO_PARAM[bank_name]
             param = getattr(layer, param_name, None)
@@ -132,7 +132,16 @@ class ExpertCacheOffloader(BaseOffloader):
             # on the host.
             param.data = host_tensor
             setattr(param, EXPERT_OFFLOADED_ATTR, True)
-            banks[bank_name] = host_tensor
+            # Store the Parameter object, not this snapshot of `.data`: some
+            # formats (NVFP4) reassign `param.data` again in
+            # process_weights_after_loading (host -> transient GPU -> a new
+            # converted host tensor), which runs AFTER this diversion but
+            # BEFORE post_init() builds the slot cache. Keeping only the
+            # Parameter lets post_init() read whatever `.data` currently is,
+            # instead of silently wiring the slot cache to this stale,
+            # unconverted snapshot (confirmed on real hardware: the CUTLASS
+            # kernel would have been fed never-swizzled/never-padded weights).
+            banks[bank_name] = param
 
         # Validate a uniform expert count across all offloaded layers.
         num_experts = int(next(iter(banks.values())).shape[0])
@@ -188,9 +197,14 @@ class ExpertCacheOffloader(BaseOffloader):
             pin_memory=self.pin_memory,
             prefill_overlap=self.prefill_overlap,
         )
-        # sources[name] -> list of per-layer host tensors.
+        # sources[name] -> list of per-layer host tensors. Read `.data` now
+        # (not at diversion time): formats whose process_weights_after_loading
+        # reassigns it (see _divert_routed_experts) have already run by the
+        # time post_init() is called (model_loader.load_model() completes
+        # fully -- construct, load weights, process_weights_after_loading --
+        # before the runner calls get_offloader().post_init()).
         sources: dict[str, list[torch.Tensor]] = {
-            name: [banks[name] for banks in self._layer_banks]
+            name: [banks[name].data for banks in self._layer_banks]
             for name in BANK_SCHEMAS[self.quant_format]
         }
         cache.set_bank_sources(sources)

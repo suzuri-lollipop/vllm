@@ -200,7 +200,14 @@ def fused_copy_rows_cpu(
         rows = source[idx.to(source.device)]
         if rows.device != cache_tensor.device:
             rows = rows.to(cache_tensor.device, non_blocking=True)
-        cache_tensor.index_copy_(0, slots.to(cache_tensor.device), rows)
+        # index_copy_ has no CUDA kernel for some narrow dtypes (confirmed on
+        # real hardware: NotImplementedError for float8_e4m3fn scale banks,
+        # e.g. the NVFP4 offload format's per-block/per-expert scale rows).
+        # Plain indexed assignment lowers to index_put_, which has broader
+        # dtype coverage; safe here because `slots` are unique LRU slot
+        # assignments (no duplicate-index accumulation to worry about, unlike
+        # a general index_put_ use).
+        cache_tensor[slots.to(cache_tensor.device)] = rows
 
 
 if HAS_TRITON:

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -130,16 +131,28 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
-def _get_ple_embedding_quant_method(
+def _ple_table_is_fp8(
     quant_config: QuantizationConfig | None,
     prefix: str,
-) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+    ple_embedding_dtype: str | torch.dtype | None,
+) -> bool:
+    """Whether the PLE n-gram table is stored as global-scale FP8.
+
+    True when the model config declares the PLE embedding as an FP8 dtype
+    (``ple_embedding_dtype``) -- this is how checkpoints quantized by something
+    other than ``Fp8Config`` mark their PLE shards. Qwen3.8-Flash-Next-NVFP4 is
+    quantized by ModelOpt NVFP4, which keeps ``*.ple.*`` out of the NVFP4 quant
+    (so ``quant_config`` here is *not* an ``Fp8Config``) yet stores the table as
+    ``float8_e4m3fn``. When the dtype hint is absent, fall back to the
+    ``Fp8Config`` serialized check.
+    """
+    if ple_embedding_dtype is not None:
+        return "float8" in str(ple_embedding_dtype).lower()
 
     if not isinstance(quant_config, Fp8Config):
-        return None
+        return False
     if not quant_config.is_checkpoint_fp8_serialized:
-        return None
+        return False
 
     ignored_layers = quant_config.ignored_layers
     if is_layer_skipped(
@@ -148,10 +161,20 @@ def _get_ple_embedding_quant_method(
         quant_config.packed_modules_mapping,
         match_mode=quant_config.ignored_layers_match_mode,
     ):
-        return None
+        return False
     # PLE checkpoint shards form one runtime embedding parameter.
     shard_prefix = f"{prefix}.shard_"
-    if any(name.startswith(shard_prefix) for name in ignored_layers):
+    return not any(name.startswith(shard_prefix) for name in ignored_layers)
+
+
+def _get_ple_embedding_quant_method(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    ple_embedding_dtype: str | torch.dtype | None = None,
+) -> QuantizeMethodBase | None:
+    """Select global-scale FP8 for FP8-serialized PLE checkpoint shards."""
+
+    if not _ple_table_is_fp8(quant_config, prefix, ple_embedding_dtype):
         return None
     return Qwen4ExpPLEFp8EmbeddingMethod()
 
@@ -163,10 +186,13 @@ def _get_ple_embedding_method(
     disk_config: PLEDiskConfig | None,
     max_gathered_rows: int,
     params_dtype: torch.dtype | None,
+    ple_embedding_dtype: str | torch.dtype | None = None,
 ) -> QuantizeMethodBase | None:
     """Pick the PLE table backend: SSD-resident when asked for, else in VRAM."""
 
-    resident = _get_ple_embedding_quant_method(quant_config, prefix)
+    resident = _get_ple_embedding_quant_method(
+        quant_config, prefix, ple_embedding_dtype
+    )
     if disk_config is None:
         return resident
     is_fp8_table = isinstance(resident, Qwen4ExpPLEFp8EmbeddingMethod)
@@ -350,6 +376,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             disk_config=ple_disk_config,
             max_gathered_rows=max_total_tokens * self.ngram_heads,
             params_dtype=params_dtype,
+            ple_embedding_dtype=getattr(config, "ple_embedding_dtype", None),
         )
         # Disk rows are read on the host, so the lookup has to sit at a
         # compilation split point instead of inside the captured graph.
@@ -573,6 +600,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
             stager.verify_host_ids(self.layer_name, ngram_ids)
         torch.ops.vllm.qwen4_exp_lookup_ple_disk_rows(rows, self.layer_name)
+        # PLEDiskStager.lookup() already zeroed rows this rank does not own
+        # (its disk store only holds this rank's [tp_start, tp_end) shard);
+        # combine with the other ranks' real contributions the same way
+        # VocabParallelEmbedding.forward() does for the non-staged path
+        # (which goes through self.ngram_embedding(...) and gets this for
+        # free). Skipped at tp_size==1, where the mask is always all-False
+        # anyway but the collective would still cost a no-op sync.
+        if self.ngram_embedding.tp_size > 1:
+            rows = tensor_model_parallel_all_reduce(rows)
         return rows.flatten(-2)
 
     def gather_disk_rows(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:

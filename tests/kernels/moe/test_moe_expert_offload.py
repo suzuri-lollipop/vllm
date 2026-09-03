@@ -876,6 +876,86 @@ def test_fp8_bank_geometry_bytes():
     assert cache.bank_caches["w13_scale"].dtype == torch.float32
 
 
+def test_nvfp4_bank_schema_and_param_mapping():
+    assert BANK_SCHEMAS["nvfp4"] == (
+        "w13",
+        "w13_qscale",
+        "w13_gscale2",
+        "a13_gscale",
+        "w2",
+        "w2_qscale",
+        "w2_gscale2",
+        "a2_gscale",
+    )
+    from vllm.model_executor.layers.fused_moe.offload.slot_cache import BANK_TO_PARAM
+
+    assert BANK_TO_PARAM["w13_qscale"] == "w13_weight_scale"
+    assert BANK_TO_PARAM["w13_gscale2"] == "w13_weight_scale_2"
+    assert BANK_TO_PARAM["a13_gscale"] == "w13_input_scale"
+    assert BANK_TO_PARAM["w2_qscale"] == "w2_weight_scale"
+    assert BANK_TO_PARAM["w2_gscale2"] == "w2_weight_scale_2"
+    assert BANK_TO_PARAM["a2_gscale"] == "w2_input_scale"
+    # No collision with the fp8_block bank names sharing the same dict.
+    assert BANK_TO_PARAM["w13_scale"] == "w13_weight_scale_inv"
+
+
+def _make_nvfp4_cache(num_experts: int, cache_size: int) -> ExpertSlotCache:
+    hidden, inter, group = 16, 24, 16
+    NVFP4_U8 = torch.uint8
+    NVFP4_SCALE = torch.float8_e4m3fn
+    shapes = {
+        "w13": (num_experts, 2 * inter, hidden // 2),
+        "w2": (num_experts, hidden, inter // 2),
+        "w13_qscale": (num_experts, 2 * inter, hidden // group),
+        "w2_qscale": (num_experts, hidden, inter // group),
+        "w13_gscale2": (num_experts, 1),
+        "w2_gscale2": (num_experts, 1),
+        "a13_gscale": (num_experts, 1),
+        "a2_gscale": (num_experts, 1),
+    }
+    dtypes = {
+        "w13": NVFP4_U8,
+        "w2": NVFP4_U8,
+        "w13_qscale": NVFP4_SCALE,
+        "w2_qscale": NVFP4_SCALE,
+        "w13_gscale2": torch.float32,
+        "w2_gscale2": torch.float32,
+        "a13_gscale": torch.float32,
+        "a2_gscale": torch.float32,
+    }
+    cache = ExpertSlotCache(
+        num_layers=1,
+        num_experts=num_experts,
+        cache_size=cache_size,
+        device=CPU,
+        quant_format="nvfp4",
+    )
+    sources = {n: [torch.zeros(shapes[n], dtype=dtypes[n])] for n in cache.bank_schema}
+    cache.set_bank_sources(sources)
+    return cache
+
+
+def test_nvfp4_bank_geometry_bytes():
+    cache = _make_nvfp4_cache(num_experts=4, cache_size=4)
+    hidden, inter, group = 16, 24, 16
+    # 1 byte/elem for packed fp4 weights (2 items/byte -> hidden/2 columns).
+    w13_row = 2 * inter * (hidden // 2) * 1
+    w2_row = hidden * (inter // 2) * 1
+    # 1 byte/elem for the fp8_e4m3 per-block scales.
+    q13_row = 2 * inter * (hidden // group) * 1
+    q2_row = hidden * (inter // group) * 1
+    # 4 bytes/elem for the four per-expert fp32 scalar rows (1 element each):
+    # w13_gscale2, a13_gscale, w2_gscale2, a2_gscale.
+    scalar_row = 1 * 4
+    assert cache.bytes_per_slot() == (
+        w13_row + q13_row + w2_row + q2_row + 4 * scalar_row
+    )
+    assert cache.slot_cache_bytes() == 4 * cache.bytes_per_slot()
+    assert cache.bank_caches["w13"].dtype == torch.uint8
+    assert cache.bank_caches["w13_qscale"].dtype == torch.float8_e4m3fn
+    assert cache.bank_caches["a13_gscale"].shape == (4, 1)
+
+
 class _MockQuantConfig:
     def __init__(self, method):
         self._method = method
@@ -948,7 +1028,7 @@ def test_routing_rejects_other_quant_loudly():
         pass
 
     qc = _MockQuantConfig(_OtherMethod())
-    with pytest.raises(NotImplementedError, match="NVFP4/MXFP4/AWQ"):
+    with pytest.raises(NotImplementedError, match="MXFP4, AWQ"):
         OffloadRoutedExperts._get_quant_method(
             object.__new__(OffloadRoutedExperts), "x", qc, _make_moe_config()
         )
@@ -1211,6 +1291,21 @@ def test_reset_clears_prefill_tracking():
     assert cache._prefill_buffer_layer == [None, None]
     assert cache._prefill_buffer_released == [True, True]
     assert cache._prefill_buffer_has_release_event == [False, False]
+
+
+def test_ple_table_is_fp8_under_non_fp8_quant():
+    """The PLE n-gram table is FP8 whenever the config declares it so, even when
+    the global quant config is not Fp8Config (e.g. ModelOpt NVFP4 checkpoints keep
+    ``*.ple.*`` out of the NVFP4 quant but store it as float8_e4m3fn)."""
+    from vllm.models.qwen4_exp.nvidia.ple_layer import _ple_table_is_fp8
+
+    # Declared FP8 by dtype string or torch dtype -> True regardless of quant cfg.
+    assert _ple_table_is_fp8(None, "x.ple", "float8_e4m3fn")
+    assert _ple_table_is_fp8(None, "x.ple", torch.float8_e4m3fn)
+    # Non-FP8 dtype -> False.
+    assert not _ple_table_is_fp8(None, "x.ple", "bfloat16")
+    # No dtype hint and no Fp8Config -> False.
+    assert not _ple_table_is_fp8(None, "x.ple", None)
 
 
 @pytest.mark.skipif(not _CUDA_AND_TRITON, reason="requires CUDA + Triton")

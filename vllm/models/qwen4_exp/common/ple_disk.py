@@ -315,11 +315,21 @@ class PLEHostHasher:
     ngram_size: int
     heads_per_ngram: int
     eos_token_id: int
+    tp_start: int = 0
+    tp_end: int | None = None
+    """[tp_start, tp_end) is this rank's row-id range in the GLOBAL (unsharded)
+    row space that ``offsets``/``vocab_sizes`` describe. ``row_ids()`` returns
+    ids in that global space (matching every rank's identical ``offsets``
+    buffer); a row belonging to another rank must never reach this rank's
+    disk store (it holds only its own [tp_start, tp_end) shard). ``tp_end is
+    None`` means "no sharding" (TP=1): every id is local.
+    """
 
     @classmethod
     def from_embedding(cls, embedding) -> "PLEHostHasher":
         """Build a hasher from a live `Qwen4ExpNGramEmbedding`."""
         to_np = lambda buffer: buffer.detach().to("cpu").numpy().astype(np.int64)
+        shard_indices = embedding.ngram_embedding.shard_indices
         return cls(
             multipliers=to_np(embedding.layer_multipliers),
             vocab_sizes=to_np(embedding.ngram_heads_vocab_sizes),
@@ -327,6 +337,8 @@ class PLEHostHasher:
             ngram_size=int(embedding.ngram_size),
             heads_per_ngram=int(embedding.heads_per_ngram),
             eos_token_id=int(embedding.eos_token_id),
+            tp_start=int(shard_indices.org_vocab_start_index),
+            tp_end=int(shard_indices.org_vocab_end_index),
         )
 
     @property
@@ -387,6 +399,42 @@ class PLEHostHasher:
             ids = np.mod(taken[:, None], self.vocab_sizes[start:end])
             blocks.append(ids + self.offsets[start:end])
         return np.concatenate(blocks, axis=-1)
+
+    def local_row_ids_and_mask(
+        self,
+        token_ids: np.ndarray,
+        query_start_loc: np.ndarray,
+        ngram_context: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Row ids shifted into this rank's local disk-store space, plus a mask.
+
+        ``PLEVocabParallelEmbedding``'s ordinary (VRAM-resident) forward
+        shards the table by contiguous global row range and combines ranks
+        with a masked-zero + all-reduce (see
+        ``vllm.model_executor.layers.vocab_parallel_embedding.get_masked_input_and_mask``);
+        the disk backend's row-per-token gather has no such built-in masking,
+        so this reproduces it explicitly: a global id outside
+        ``[tp_start, tp_end)`` belongs to a different rank's shard and must
+        never be staged from this rank's disk store (out of range -> the
+        store's own ``IndexError``, confirmed on real TP2 hardware). Those
+        ids are remapped to local row 0 (any in-bounds placeholder works,
+        since the caller must zero the corresponding output rows) and
+        flagged in the returned mask for the caller to zero-fill after the
+        gather, before an all-reduce combines every rank's contribution.
+
+        Returns:
+            ``(local_ids, other_rank_mask)``, both ``[num_tokens, ngram_heads]``:
+            ``local_ids`` are valid indices into this rank's disk store, and
+            ``other_rank_mask`` is True where the row belongs to another rank
+            (the caller must zero that position's embedding before summing
+            across ranks).
+        """
+        global_ids = self.row_ids(token_ids, query_start_loc, ngram_context)
+        if self.tp_end is None:
+            return global_ids, np.zeros_like(global_ids, dtype=bool)
+        other_rank_mask = (global_ids < self.tp_start) | (global_ids >= self.tp_end)
+        local_ids = np.where(other_rank_mask, 0, global_ids - self.tp_start)
+        return local_ids, other_rank_mask
 
     def _shift_with_eos_barrier(self, packed: np.ndarray) -> list[np.ndarray]:
         """``out[s][b, p]`` is the token ``s`` left of ``p``, or EOS at a boundary."""
@@ -1046,6 +1094,14 @@ class _PLEDiskLayerEntry:
     flag: torch.Tensor
     """Pinned int64 flag this layer's captured graph WAITs on (memops)."""
 
+    mask_pinned: torch.Tensor
+    """Pinned ``[max_num_tokens, ngram_heads]`` bool staging buffer for
+    ``other_rank_mask`` (see ``PLEHostHasher.local_row_ids_and_mask``)."""
+
+    mask_device: torch.Tensor
+    """Device copy of ``mask_pinned``; ``lookup`` zero-fills rows this rank
+    does not own before the caller's TP all-reduce recombines them."""
+
 
 @dataclass
 class _PLEDeferredFill:
@@ -1128,10 +1184,19 @@ class PLEDiskStager:
             )
         pin = self.device.type == "cuda" and is_pin_memory_available()
         flag = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
+        ngram_heads = int(embedding.ngram_heads)
+        mask_pinned = torch.zeros(
+            (self.max_num_tokens, ngram_heads), dtype=torch.bool, pin_memory=pin
+        )
+        mask_device = torch.zeros(
+            (self.max_num_tokens, ngram_heads), dtype=torch.bool, device=self.device
+        )
         self._layers[layer_name] = _PLEDiskLayerEntry(
             hasher=PLEHostHasher.from_embedding(embedding),
             store=store,
             flag=flag,
+            mask_pinned=mask_pinned,
+            mask_device=mask_device,
         )
 
     def attach_model(self, model: nn.Module) -> int:
@@ -1299,10 +1364,19 @@ class PLEDiskStager:
         context = self._readback_context[:num_reqs].numpy().astype(np.int64)
         staged = []
         for layer_name, entry in self._layers.items():
-            row_ids = entry.hasher.row_ids(tokens, query_start_loc, context)
+            row_ids, other_rank_mask = entry.hasher.local_row_ids_and_mask(
+                tokens, query_start_loc, context
+            )
             if self.verify_host_hash:
-                self._host_row_ids[layer_name] = row_ids
+                # verify_host_ids compares against the device hasher's ids,
+                # which (like row_ids()) are global/unsharded.
+                self._host_row_ids[layer_name] = entry.hasher.row_ids(
+                    tokens, query_start_loc, context
+                )
             staged.append(entry.store.stage(row_ids))
+            n = row_ids.shape[0]
+            entry.mask_pinned[:n].copy_(torch.from_numpy(other_rank_mask))
+            entry.mask_device[:n].copy_(entry.mask_pinned[:n], non_blocking=True)
         for entry, handle in zip(self._layers.values(), staged):
             entry.store.scatter_ordered(handle)
 
@@ -1330,6 +1404,12 @@ class PLEDiskStager:
         num_rows = output.shape[0] * output.shape[1]
         device_rows = entry.store.copy_ordered(num_rows)
         output.copy_(device_rows.view(entry.store.dtype).reshape(output.shape))
+        # Zero rows that belong to another TP rank's disk-store shard (staged
+        # as a local-row-0 placeholder in _fill); the caller all-reduces
+        # across the TP group to recombine each rank's real contribution,
+        # mirroring VocabParallelEmbedding's own masked-zero + all-reduce.
+        num_tokens = output.shape[0]
+        output.masked_fill_(entry.mask_device[:num_tokens].unsqueeze(-1), 0)
 
     def verify_host_ids(self, layer_name: str, device_ids: torch.Tensor) -> None:
         """Compare device-hashed row ids against the host fill's ids.
