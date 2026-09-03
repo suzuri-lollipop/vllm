@@ -90,7 +90,13 @@ def lru_ensure_cpu(
     base = layer_id * num_experts
 
     flat = expert_ids.view(-1)
-    actives = _unique_in_order(flat.tolist())
+    # Under expert parallelism the caller has already mapped global expert ids
+    # through ``expert_map``, so ``-1`` marks a token routed to an expert this
+    # rank does not own. Those are not residency candidates (this rank has no
+    # bank row for them) and must survive the rewrite below as ``-1``, which is
+    # the sentinel every fused-MoE kernel reads as "write zeros" -- the runner
+    # then all-reduces each rank's partial sum.
+    actives = [e for e in _unique_in_order(flat.tolist()) if e >= 0]
 
     step = int(cache.step.item()) + 1
     cache.step.fill_(step)
@@ -139,8 +145,12 @@ def lru_ensure_cpu(
         cache.src_indices[idx] = expert  # layer-local expert row
 
     # Rewrite raw expert ids -> slot ids (every active is resident now).
+    # ``-1`` (not this rank's expert) passes through untouched; indexing
+    # slot_for_id with it would silently resolve to the last expert's slot.
     for i in range(flat.numel()):
-        flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+        expert = int(flat[i].item())
+        if expert >= 0:
+            flat[i] = int(cache.slot_for_id[layer_id, expert].item())
 
 
 def materialize_layer_cpu(
@@ -245,7 +255,9 @@ if HAS_TRITON:
             owner_active = c_mask & False
             for i in tl.range(num_active):
                 ei = tl.load(expert_ids_ptr + i)
-                owner_active = owner_active | (oid == base + ei)
+                # ei == -1 (expert-parallel: not this rank's) would protect
+                # base - 1, i.e. the previous layer's last expert.
+                owner_active = owner_active | ((ei >= 0) & (oid == base + ei))
             u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
             for i in tl.range(num_missing):
                 victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -261,10 +273,15 @@ if HAS_TRITON:
                 u = tl.where(off_c == victim, 9223372036854775807, u)
 
         # ---- Phase 3: rewrite expert_ids -> slot id ----
+        # ``-1`` (expert-parallel: not this rank's expert) is left as-is: the
+        # load would otherwise resolve to slot_for_id[base - 1], i.e. the
+        # previous layer's last expert (and out of bounds at layer 0), quietly
+        # computing that expert instead of contributing zero.
         for i in tl.range(num_active):
             e = tl.load(expert_ids_ptr + i)
-            s = tl.load(slot_for_id_ptr + base + e)
-            tl.store(expert_ids_ptr + i, s)
+            if e >= 0:
+                s = tl.load(slot_for_id_ptr + base + e)
+                tl.store(expert_ids_ptr + i, s)
 
     @triton.jit(do_not_specialize=["layer_id"])
     def _materialize_layer_kernel(

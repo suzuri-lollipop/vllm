@@ -80,6 +80,65 @@ def make_cache(
 # ---------------------------------------------------------------------------
 
 
+def test_ensure_passes_through_non_local_experts_under_ep():
+    """Expert parallelism: -1 (another rank's expert) must survive untouched.
+
+    _offload_forward maps global routing ids through expert_map before the
+    ensure, so -1 marks a token this rank contributes nothing for. Resolving it
+    against slot_for_id would silently compute the LAST expert instead (negative
+    indexing), i.e. wrong numerics rather than a crash.
+    """
+    cache = make_cache(num_layers=1)
+    ids = torch.tensor([3, -1, 2, -1], dtype=torch.int32)
+    lru_ensure_cpu(cache, 0, ids)
+
+    # Only the two real experts were fetched; -1 is not a residency candidate.
+    assert int(cache.num_indices.item()) == 2
+    assert int(cache.slot_for_id[0, 3].item()) >= 0
+    assert int(cache.slot_for_id[0, 2].item()) >= 0
+    # -1 passes through; the real ids became slot ids.
+    assert ids.tolist() == [
+        int(cache.slot_for_id[0, 3].item()),
+        -1,
+        int(cache.slot_for_id[0, 2].item()),
+        -1,
+    ]
+
+
+def test_ensure_all_non_local_is_a_noop_under_ep():
+    """A batch routed entirely to other ranks' experts fetches nothing."""
+    cache = make_cache(num_layers=1)
+    ids = torch.full((4,), -1, dtype=torch.int32)
+    lru_ensure_cpu(cache, 0, ids)
+
+    assert int(cache.num_indices.item()) == 0
+    assert ids.tolist() == [-1, -1, -1, -1]
+    # Nothing became resident.
+    assert int((cache.slot_for_id >= 0).sum().item()) == 0
+
+
+def test_ensure_non_local_does_not_protect_previous_layer_slot_under_ep():
+    """-1 must not shield flat id ``base - 1`` (the previous layer's last expert).
+
+    Eviction protection is keyed on ``base + expert_id``; an unguarded -1 marks
+    the preceding layer's last expert as "routed this step", needlessly pinning
+    it in the cache.
+    """
+    cache = make_cache(num_layers=2, num_experts=4, cache_size=4)
+    # Fill the cache with layer 0's experts, oldest usage on expert 3.
+    lru_ensure_cpu(cache, 0, torch.tensor([3, 0, 1, 2], dtype=torch.int32))
+    cache.usage[int(cache.slot_for_id[0, 3].item())] = 0
+
+    # Layer 1 (base = 4) routes one real expert plus a non-local -1.
+    victim_slot = int(cache.slot_for_id[0, 3].item())
+    lru_ensure_cpu(cache, 1, torch.tensor([0, -1], dtype=torch.int32))
+
+    # Layer 0's expert 3 (flat id base-1 == 3) was the argmin victim and must
+    # have been evicted rather than protected by the -1.
+    assert int(cache.slot_for_id[1, 0].item()) == victim_slot
+    assert int(cache.slot_for_id[0, 3].item()) == -1
+
+
 def test_ensure_cold_start_assigns_and_rewrites_in_place():
     cache = make_cache(num_layers=1)
     ids = torch.tensor([3, 1, 2, 1], dtype=torch.int32)

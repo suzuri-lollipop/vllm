@@ -93,20 +93,38 @@ def _maybe_offload_routed_experts_cls(
     """Return the expert-cache offload ``RoutedExperts`` subclass when applicable.
 
     Selects :class:`OffloadRoutedExperts` when the ``expert_cache`` offload backend
-    is enabled and the deployment is eligible (NVIDIA CUDA, no expert parallelism /
-    EPLB / LoRA). Otherwise returns the default :class:`RoutedExperts`. The final
+    is enabled and the deployment is eligible (NVIDIA CUDA, no EPLB / all2all
+    kernels / LoRA). Otherwise returns the default :class:`RoutedExperts`. The final
     format decision lives in ``OffloadRoutedExperts._get_quant_method``: unquantized
-    (bf16) and block-quantized FP8 experts are supported; every other quantization
-    fails loudly rather than silently skipping the offload.
+    (bf16), block-quantized FP8 and NVFP4 experts are supported; every other
+    quantization fails loudly rather than silently skipping the offload.
+
+    Expert parallelism IS supported (and is the way to fit a many-expert model
+    whose full expert set does not fit in host RAM once per rank): each rank
+    banks only ``num_local_experts``, ``_offload_forward`` maps global routing
+    ids through ``expert_map`` before touching the slot cache, and MoERunner's
+    final all-reduce sums the per-rank partials.
     """
     offload_config = getattr(vllm_config, "offload_config", None)
     if offload_config is None or offload_config.offload_backend != "expert_cache":
         return RoutedExperts
 
-    if enable_eplb or moe_parallel_config.use_ep or moe_parallel_config.ep_size > 1:
+    if enable_eplb:
         logger.warning_once(
-            "expert_cache offload does not support expert parallelism / EPLB; "
-            "falling back to the default (non-offloaded) routed experts."
+            "expert_cache offload does not support EPLB: the host banks and the "
+            "slot cache are built once in ExpertCacheOffloader.post_init(), so "
+            "they cannot follow EPLB's runtime expert->rank rebalancing. "
+            "Falling back to the default (non-offloaded) routed experts."
+        )
+        return RoutedExperts
+    if moe_parallel_config.use_all2all_kernels:
+        logger.warning_once(
+            "expert_cache offload does not support all2all MoE kernels "
+            "(expert parallelism combined with DP / PCP / sequence parallelism): "
+            "those dispatch tokens between ranks in the batched activation "
+            "format, while the slot-cache GEMM consumes the standard format and "
+            "relies on MoERunner's final all-reduce to combine ranks. Falling "
+            "back to the default (non-offloaded) routed experts."
         )
         return RoutedExperts
     if vllm_config.lora_config is not None:

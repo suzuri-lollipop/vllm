@@ -92,6 +92,19 @@ def _offload_forward(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
+    # Expert parallelism: the router emits GLOBAL expert ids, but this rank
+    # banks only its own shard of the experts (create_weights is handed
+    # num_local_experts), so translate to local ids up front -- ``expert_map``
+    # yields -1 for an expert another rank owns, which every path below (LRU
+    # ensure, materialize, and the fused kernels) treats as "contribute
+    # nothing". Each rank therefore computes a partial sum and MoERunner's
+    # final all-reduce (ep_size > 1) combines them. Doing it here rather than
+    # passing expert_map down is what keeps the ids in slot space for the
+    # kernel, exactly as in the non-EP case.
+    expert_map = layer.expert_map
+    if expert_map is not None:
+        topk_ids = expert_map[topk_ids.long()].to(torch.int32)
+
     # Double-buffered prefill streams the whole expert layer into a borrowed
     # buffer and computes the GEMM over a buffer view offset by buffer_id * E.
     # That is only correct when the GEMM has no per-row weight-scale bank read by
