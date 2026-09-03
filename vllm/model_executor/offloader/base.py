@@ -98,6 +98,15 @@ class BaseOffloader(ABC):
         """Join streams after forward. Override in subclasses."""
         pass
 
+    def reset_offload_state(self) -> None:  # noqa: B027
+        """Reset any offload state mutated by dummy/capture forwards.
+
+        Called around CUDA-graph capture. Override in subclasses whose offload
+        bookkeeping (e.g. the expert slot cache's LRU state) is touched by the
+        warmup/capture runs and must start clean for real inference.
+        """
+        pass
+
     def _wait_for_layer(self, layer_idx: int) -> None:  # noqa: B027
         """Wait for layer prefetch. Override in subclasses."""
         pass
@@ -143,7 +152,8 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
 
     Uses the explicit ``offload_backend`` selector.  When set to ``"auto"``,
     selects prefetch if ``offload_group_size > 0``, UVA if
-    ``cpu_offload_gb > 0``, otherwise noop.
+    ``cpu_offload_gb > 0``, otherwise noop.  ``"expert_cache"`` is only ever
+    selected explicitly (it needs a ``moe_cache_size``).
     """
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
@@ -151,6 +161,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
+    expert_cache = offload_config.expert_cache
 
     if backend == "auto":
         if prefetch.offload_group_size > 0:
@@ -172,6 +183,14 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
         return UVAOffloader(
             cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
             cpu_offload_params=uva.cpu_offload_params,
+        )
+    elif backend == "expert_cache":
+        from vllm.model_executor.offloader.expert_cache import ExpertCacheOffloader
+
+        return ExpertCacheOffloader(
+            cache_size=expert_cache.moe_cache_size,
+            pin_memory=expert_cache.moe_cache_pin_memory,
+            prefill_overlap=expert_cache.moe_prefill_overlap,
         )
     else:
         return NoopOffloader()

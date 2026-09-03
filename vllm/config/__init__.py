@@ -29,6 +29,8 @@ from vllm.config.model import (
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.offload import (
+    EXPERT_CACHE_MAX_SLOTS,
+    ExpertCacheOffloadConfig,
     OffloadBackend,
     OffloadConfig,
     PrefetchOffloadConfig,
@@ -103,6 +105,8 @@ __all__ = [
     # From vllm.config.observability
     "ObservabilityConfig",
     # From vllm.config.offload
+    "EXPERT_CACHE_MAX_SLOTS",
+    "ExpertCacheOffloadConfig",
     "OffloadBackend",
     "OffloadConfig",
     "PrefetchOffloadConfig",

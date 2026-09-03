@@ -1745,8 +1745,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
+            #
+            # num_reqs is populated only for eager (NONE) forwards. In piecewise
+            # mode this descriptor doubles as the per-subgraph CUDA-graph cache
+            # key (BatchDescriptor is hashed/compared on all fields), and graphs
+            # must be reused across any request count, so num_reqs stays None
+            # there. Eager forwards are not graph keys, so exposing the request
+            # count lets consumers (e.g. the MoE expert-offload prefill path)
+            # distinguish prefill/mixed batches (num_tokens > num_reqs).
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
+                num_reqs=(
+                    input_batch.num_reqs
+                    if batch_desc.cg_mode == CUDAGraphMode.NONE
+                    else None
+                ),
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
