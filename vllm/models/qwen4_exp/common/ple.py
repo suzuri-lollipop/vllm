@@ -80,7 +80,13 @@ def copy_ple_embedding_shard_(
 
 
 class PLEVocabParallelEmbedding(VocabParallelEmbedding):
-    """Vocab-parallel embedding that accepts checkpoint row shards."""
+    """Vocab-parallel embedding that accepts checkpoint row shards.
+
+    A quantization method may claim the row shards instead of having them
+    copied into ``param`` by exposing a ``load_ple_shard(loaded_weight, *,
+    checkpoint_start, tp_start, tp_end)`` method. The disk backend uses this to
+    spool the table without ever materializing it on the device.
+    """
 
     def weight_loader(
         self,
@@ -90,6 +96,15 @@ class PLEVocabParallelEmbedding(VocabParallelEmbedding):
     ) -> None:
         if checkpoint_start is None:
             super().weight_loader(param, loaded_weight)
+            return
+        shard_sink = getattr(self.quant_method, "load_ple_shard", None)
+        if shard_sink is not None:
+            shard_sink(
+                loaded_weight,
+                checkpoint_start=checkpoint_start,
+                tp_start=self.shard_indices.org_vocab_start_index,
+                tp_end=self.shard_indices.org_vocab_end_index,
+            )
             return
         copy_ple_embedding_shard_(
             param,

@@ -45,6 +45,11 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import PLEVocabParallelEmbedding
+from ..common.ple_disk import (
+    PLEDiskConfig,
+    Qwen4ExpPLEDiskEmbeddingMethod,
+    resolve_ple_disk_config,
+)
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -146,6 +151,33 @@ def _get_ple_embedding_quant_method(
     if any(name.startswith(shard_prefix) for name in ignored_layers):
         return None
     return Qwen4ExpPLEFp8EmbeddingMethod()
+
+
+def _get_ple_embedding_method(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    *,
+    disk_config: PLEDiskConfig | None,
+    max_gathered_rows: int,
+    params_dtype: torch.dtype | None,
+) -> QuantizeMethodBase | None:
+    """Pick the PLE table backend: SSD-resident when asked for, else in VRAM."""
+
+    resident = _get_ple_embedding_quant_method(quant_config, prefix)
+    if disk_config is None:
+        return resident
+    is_fp8_table = isinstance(resident, Qwen4ExpPLEFp8EmbeddingMethod)
+    return Qwen4ExpPLEDiskEmbeddingMethod(
+        disk_config,
+        spool_name=prefix,
+        max_gathered_rows=max_gathered_rows,
+        has_weight_scale=is_fp8_table,
+        table_dtype=(
+            torch.float8_e4m3fn
+            if is_fp8_table
+            else (params_dtype or torch.get_default_dtype())
+        ),
+    )
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -256,6 +288,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         layer_name: str,
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
+        ple_disk_config: PLEDiskConfig | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = layer_name
@@ -308,15 +341,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
+        quant_method = _get_ple_embedding_method(
+            quant_config,
+            f"{prefix}.ngram_embedding",
+            disk_config=ple_disk_config,
+            max_gathered_rows=max_total_tokens * self.ngram_heads,
+            params_dtype=params_dtype,
+        )
+        # Disk rows are read on the host, so the lookup has to sit at a
+        # compilation split point instead of inside the captured graph.
+        disk_method = (
+            quant_method
+            if isinstance(quant_method, Qwen4ExpPLEDiskEmbeddingMethod)
+            else None
+        )
+        self.gathers_from_disk = disk_method is not None
+        self.table_dtype = None if disk_method is None else disk_method.table_dtype
         self.ngram_embedding = PLEVocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
             params_dtype=params_dtype,
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
-            ),
+            quant_method=quant_method,
         )
         self.register_buffer(
             "positions_buffer",
@@ -453,7 +500,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids,
             self.layer_name,
         )
-        return self.ngram_embedding(ngram_ids).flatten(-2)
+        if not self.gathers_from_disk:
+            return self.ngram_embedding(ngram_ids).flatten(-2)
+        rows = torch.empty(
+            (*ngram_ids.shape, self.head_dim),
+            dtype=self.table_dtype,
+            device=ngram_ids.device,
+        )
+        torch.ops.vllm.qwen4_exp_gather_ple_disk_rows(ngram_ids, rows, self.layer_name)
+        return rows.flatten(-2)
+
+    def gather_disk_rows(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
+        """Read this forward's table rows off disk into ``output``."""
+        output.copy_(self.ngram_embedding(ngram_ids))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -562,6 +621,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             layer_name=prefix,
             quant_config=quant_config,
             params_dtype=model_config.dtype,
+            ple_disk_config=resolve_ple_disk_config(vllm_config),
         )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
@@ -1215,6 +1275,24 @@ def qwen4_exp_compute_ple_ngram_ids_fake(
     return
 
 
+def qwen4_exp_gather_ple_disk_rows(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Gather SSD-resident PLE rows outside piecewise CUDA graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.ple_embedding.gather_disk_rows(ngram_ids, output)
+
+
+def qwen4_exp_gather_ple_disk_rows_fake(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1238,6 +1316,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_compute_ple_ngram_ids,
     mutates_args=["output"],
     fake_impl=qwen4_exp_compute_ple_ngram_ids_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_gather_ple_disk_rows",
+    op_func=qwen4_exp_gather_ple_disk_rows,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_gather_ple_disk_rows_fake,
 )
 
 
