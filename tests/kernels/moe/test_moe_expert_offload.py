@@ -228,6 +228,147 @@ def test_copy_missing_noop_when_all_hits():
 
 
 # ---------------------------------------------------------------------------
+# Fused (device-driven) miss copy
+# ---------------------------------------------------------------------------
+
+
+def _make_identifiable_cache(num_experts: int = 4, cache_size: int = 4):
+    """Slot cache whose host-bank rows are filled with per-expert constants so
+    gathered rows are trivially recognizable, and whose slot caches start at a
+    sentinel so untouched slots are detectable."""
+    cache = make_cache(num_layers=1, num_experts=num_experts, cache_size=cache_size)
+    # Source row e is filled with (e + 1) in both banks.
+    for name in cache.bank_schema:
+        src = cache.bank_sources[name][0]
+        for e in range(num_experts):
+            src[e].fill_(float(e + 1))
+        # Slot caches start at a sentinel distinct from any source row value.
+        cache.bank_caches[name].fill_(-999.0)
+    return cache
+
+
+def test_fused_copy_rows_cpu_gather_mapping_and_multibank():
+    """CPU mirror of the fused copy: row gather mapping + fan-out to every bank."""
+    from vllm.model_executor.layers.fused_moe.offload.fused_copy import (
+        fused_copy_rows_cpu,
+    )
+
+    cache = _make_identifiable_cache()
+    # src row 1 -> slot 2, src row 3 -> slot 0, src row 2 -> slot 3.
+    cache.evict_slots[:4] = torch.tensor([2, 0, 3, 3], dtype=torch.int32)
+    cache.src_indices[:4] = torch.tensor([1, 3, 2, 0], dtype=torch.int32)
+    num_indices = torch.tensor([3], dtype=torch.int64)
+    fused_copy_rows_cpu(
+        cache.banks, 0, cache.evict_slots, cache.src_indices, num_indices
+    )
+    for name in cache.bank_schema:
+        c = cache.bank_caches[name]
+        assert torch.all(c[2] == 2.0)  # source row 1 -> value 2
+        assert torch.all(c[0] == 4.0)  # source row 3 -> value 4
+        assert torch.all(c[3] == 3.0)  # source row 2 -> value 3
+        # Slot 1 was never a destination: still the sentinel.
+        assert torch.all(c[1] == -999.0)
+
+
+def test_fused_copy_rows_cpu_masks_past_num_indices():
+    """Entries at/after num_indices are ignored, whatever garbage they hold."""
+    from vllm.model_executor.layers.fused_moe.offload.fused_copy import (
+        fused_copy_rows_cpu,
+    )
+
+    cache = _make_identifiable_cache()
+    # Only the first 2 entries are valid; the tail holds an OUT-OF-RANGE source
+    # row (99) that must NOT be read, and a destination that must NOT be written.
+    cache.evict_slots[:4] = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    cache.src_indices[:4] = torch.tensor([0, 1, 99, 99], dtype=torch.int32)
+    num_indices = torch.tensor([2], dtype=torch.int64)
+    fused_copy_rows_cpu(
+        cache.banks, 0, cache.evict_slots, cache.src_indices, num_indices
+    )
+    for name in cache.bank_schema:
+        c = cache.bank_caches[name]
+        assert torch.all(c[0] == 1.0)
+        assert torch.all(c[1] == 2.0)
+        # Slots 2 and 3 untouched (the garbage tail was masked off).
+        assert torch.all(c[2] == -999.0)
+        assert torch.all(c[3] == -999.0)
+
+
+def test_fused_copy_rows_cpu_zero_misses_noop():
+    from vllm.model_executor.layers.fused_moe.offload.fused_copy import (
+        fused_copy_rows_cpu,
+    )
+
+    cache = _make_identifiable_cache()
+    cache.evict_slots[:4].fill_(3)
+    cache.src_indices[:4].fill_(3)
+    fused_copy_rows_cpu(
+        cache.banks,
+        0,
+        cache.evict_slots,
+        cache.src_indices,
+        torch.zeros(1, dtype=torch.int64),
+    )
+    for name in cache.bank_schema:
+        assert torch.all(cache.bank_caches[name] == -999.0)
+
+
+def test_copy_missing_masks_past_num_indices_end_to_end():
+    """copy_missing (CPU reference path) honors num_indices: garbage staged past
+    the count must not be copied (an out-of-range src row would raise if read)."""
+    cache = _make_identifiable_cache()
+    # Stage a valid miss list then corrupt the tail beyond num_indices.
+    cache.ensure_experts(0, torch.tensor([0, 1], dtype=torch.int32))
+    n = int(cache.num_indices.item())
+    assert n == 2
+    tail = slice(n, cache.evict_slots.numel())
+    cache.evict_slots[tail].fill_(3)
+    cache.src_indices[tail].fill_(99)  # out of range; must never be gathered
+    cache.copy_missing()
+    for name in cache.bank_schema:
+        c = cache.bank_caches[name]
+        assert torch.all(c[0] == 1.0) or torch.all(c[0] == 2.0)
+        assert torch.all(c[1] == 1.0) or torch.all(c[1] == 2.0)
+
+
+def test_build_fused_copy_plan_none_on_cpu():
+    """No CUDA device -> no fused plan (copy falls back to the reference path)."""
+    cache = make_cache(num_layers=1, num_experts=4, cache_size=4, device=CPU)
+    assert cache._fused_plan is None
+
+
+def test_reset_offload_state_cold_starts_via_offloader():
+    off = ExpertCacheOffloader(cache_size=CACHE_SIZE, pin_memory=False)
+    off._divert_routed_experts(_FakeRoutedExperts(NUM_EXPERTS))
+    off.post_init()
+    cache = off.cache
+    assert cache is not None
+    lru_ensure_cpu(cache, 0, torch.tensor([0, 1], dtype=torch.int32))
+    assert int(cache.step.item()) == 1
+    off.reset_offload_state()
+    assert int(cache.step.item()) == 0
+    assert torch.all(cache.slot_for_id == -1)
+    clear_global_slot_cache()
+
+
+def test_fused_copy_launcher_does_not_read_count_on_host():
+    """The device-driven copy must not pull num_indices to the host (that is the
+    whole point: FULL-graph capturability). Guard at the source level: the fused
+    launcher (and kernel, when Triton is present) never calls
+    .item()/.cpu()/.tolist()/numpy() on any argument."""
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe.offload import fused_copy
+
+    src = inspect.getsource(fused_copy.fused_copy_rows)
+    kernel = getattr(fused_copy, "_fused_copy_rows_kernel", None)
+    if kernel is not None:
+        src += inspect.getsource(kernel)
+    for bad in (".item(", ".cpu(", ".tolist(", ".numpy("):
+        assert bad not in src, f"fused copy reads a host value via {bad}"
+
+
+# ---------------------------------------------------------------------------
 # Geometry / sizing
 # ---------------------------------------------------------------------------
 
@@ -550,3 +691,84 @@ def test_triton_reset_matches_cpu():
     assert torch.equal(gpu_cache.slot_for_id.cpu(), cpu_cache.slot_for_id)
     assert torch.equal(gpu_cache.id_of_slot.cpu(), cpu_cache.id_of_slot)
     assert int(gpu_cache.step.item()) == 0
+
+
+def _make_cuda_pinned_cache(
+    num_experts: int = 8, cache_size: int = 8, num_layers: int = 1
+):
+    """CUDA slot cache with pinned, per-expert-identifiable host banks."""
+    dev = torch.device("cuda")
+    cache = ExpertSlotCache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=cache_size,
+        device=dev,
+    )
+    shapes = {
+        "w13": (num_experts, 2 * INTER, HIDDEN),
+        "w2": (num_experts, HIDDEN, INTER),
+    }
+    sources = {}
+    for name in cache.bank_schema:
+        t = torch.randn(*shapes[name]).pin_memory()
+        for e in range(num_experts):
+            t[e].fill_(float(e + 1))
+        sources[name] = [t] * num_layers
+    cache.set_bank_sources(sources)
+    for name in cache.bank_schema:
+        cache.bank_caches[name].fill_(-999.0)
+    return cache
+
+
+@pytest.mark.skipif(not _CUDA_AND_TRITON, reason="requires CUDA + Triton")
+def test_fused_copy_plan_built_on_cuda():
+    cache = _make_cuda_pinned_cache(num_experts=4, cache_size=4)
+    assert cache._fused_plan is not None
+    plan = cache._fused_plan
+    assert plan.num_banks == len(cache.bank_schema) == 2
+    assert plan.dst_ptrs.dtype == torch.int64
+    assert plan.feat_bytes.dtype == torch.int64
+    assert len(plan.src_ptrs) == cache.num_layers
+    row_bytes = {
+        name: cache.bank_caches[name][0].numel()
+        * cache.bank_caches[name].element_size()
+        for name in cache.bank_schema
+    }
+    assert sorted(plan.feat_bytes.tolist()) == sorted(row_bytes.values())
+
+
+@pytest.mark.skipif(not _CUDA_AND_TRITON, reason="requires CUDA + Triton")
+def test_triton_fused_copy_matches_cpu_reference():
+    cache = _make_cuda_pinned_cache(num_experts=8, cache_size=8)
+    assert cache._fused_plan is not None
+    dev = cache.device
+    # Stage a miss list manually (isolating the copy from the LRU ensure).
+    cache.evict_slots[:4].copy_(
+        torch.tensor([2, 0, 3, 5], dtype=torch.int32, device=dev)
+    )
+    cache.src_indices[:4].copy_(
+        torch.tensor([1, 3, 2, 6], dtype=torch.int32, device=dev)
+    )
+    cache.num_indices.fill_(4)
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    # Poison the tail past num_indices: it must be masked off (src 99 is out of
+    # range and would be an OOB read if not masked).
+    cache.evict_slots[4:].fill_(7)
+    cache.src_indices[4:].fill_(99)
+
+    cache.copy_missing()
+    torch.cuda.synchronize()
+
+    # slot -> src expert (value = src expert + 1)
+    expected_map = {2: 1, 0: 3, 3: 2, 5: 6}
+    for name in cache.bank_schema:
+        c = cache.bank_caches[name].cpu()
+        for slot in range(cache.cache_size):
+            if slot in expected_map:
+                assert torch.all(c[slot] == float(expected_map[slot] + 1)), (
+                    name,
+                    slot,
+                )
+            else:
+                assert torch.all(c[slot] == -999.0), (name, slot)

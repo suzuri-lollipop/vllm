@@ -98,6 +98,15 @@ class BaseOffloader(ABC):
         """Join streams after forward. Override in subclasses."""
         pass
 
+    def reset_offload_state(self) -> None:  # noqa: B027
+        """Reset any offload state mutated by dummy/capture forwards.
+
+        Called around CUDA-graph capture. Override in subclasses whose offload
+        bookkeeping (e.g. the expert slot cache's LRU state) is touched by the
+        warmup/capture runs and must start clean for real inference.
+        """
+        pass
+
     def _wait_for_layer(self, layer_idx: int) -> None:  # noqa: B027
         """Wait for layer prefetch. Override in subclasses."""
         pass

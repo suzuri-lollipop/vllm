@@ -329,6 +329,10 @@ class CudaGraphManager:
                 metadata during warmup.
         """
         with graph_capture(device=self.device):
+            # Cold-start offload state before the capture warmups (e.g. the
+            # expert slot cache's LRU bookkeeping), so the dummy forwards run
+            # below start from a clean residency state.
+            get_offloader().reset_offload_state()
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -398,6 +402,13 @@ class CudaGraphManager:
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+                        # Reset offload state after each captured graph so the
+                        # next descriptor's warmup starts cold again (the dummy
+                        # capture forward mutated the residency bookkeeping).
+                        get_offloader().reset_offload_state()
+        # Final cold-start: dummy capture routing must not pollute the LRU state
+        # that real inference starts from.
+        get_offloader().reset_offload_state()
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:

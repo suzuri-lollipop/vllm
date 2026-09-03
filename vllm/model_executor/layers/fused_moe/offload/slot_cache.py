@@ -16,13 +16,16 @@ quant format's bank layout is declared. Only dense ``bf16`` (banks ``w13`` and
 show where quantized banks plug in later. The cache machinery itself is
 layout-agnostic and just moves expert rows.
 
-CUDA-graph status (phase 1)
----------------------------
+CUDA-graph status
+-----------------
 All per-step bookkeeping (ensure / materialize / reset) is fixed-shape and
-device-side. ``copy_missing`` currently reads the miss count on the host, which
-is correct for eager and piecewise execution but is NOT yet safe to capture into
-a FULL CUDA graph (a device-side fused copy, as FreeToken uses, is the follow-up
-that lifts that restriction).
+device-side. The miss copy is device-driven too: ``copy_missing`` launches the
+fused multi-bank gather (:mod:`...offload.fused_copy`), which reads the miss
+count ``num_indices`` on the device -- no host round trip -- so the whole
+decode movement path (ensure -> copy -> slot GEMM) is capturable into FULL CUDA
+graphs. If the fused plan cannot be built (unaligned banks, unpinned sources,
+no UVA aliasing), ``copy_missing`` falls back to the legacy host-count path,
+which stays correct for eager and piecewise execution but is NOT capturable.
 """
 
 from __future__ import annotations
@@ -32,6 +35,12 @@ from dataclasses import dataclass
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.offload.fused_copy import (
+    FusedCopyPlan,
+    build_fused_copy_plan,
+    fused_copy_rows,
+    fused_copy_rows_cpu,
+)
 
 logger = init_logger(__name__)
 
@@ -137,6 +146,9 @@ class ExpertSlotCache:
         # ensure_experts/materialize_layer; consumed by copy_missing.
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        # Device-driven fused miss-copy descriptors (built by
+        # set_bank_sources); None -> legacy host-count copy fallback.
+        self._fused_plan: FusedCopyPlan | None = None
 
     # ------------------------------------------------------------------
     # Bank registration
@@ -179,6 +191,9 @@ class ExpertSlotCache:
         self.banks = [
             (self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema
         ]
+        # Slot-cache allocations are now fixed: build the device-driven fused
+        # miss-copy descriptors (None -> legacy host-count copy fallback).
+        self._fused_plan = build_fused_copy_plan(self)
 
     # ------------------------------------------------------------------
     # Geometry / budget helpers
@@ -233,13 +248,18 @@ class ExpertSlotCache:
         Must be called after :meth:`ensure_experts` or :meth:`materialize_layer`.
         On CUDA the copies run on a dedicated copy stream and the compute stream
         is made to wait on ``copy_done_event``; on CPU (tests) it is synchronous.
+
+        When a fused copy plan is available the miss count is read on the
+        device and this call performs NO host synchronization (FULL CUDA-graph
+        capturable). Otherwise it falls back to the legacy host-count gather,
+        which is correct for eager/piecewise but not capturable.
         """
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure/materialize first)"
 
         if self.device.type != "cuda":
-            self._copy_missing_sync(layer_id)
+            self._copy_missing_reference(layer_id)
             return
 
         assert self.copy_stream is not None and self.copy_done_event is not None
@@ -248,32 +268,33 @@ class ExpertSlotCache:
         # compute stream; order the copy stream behind it.
         self.copy_stream.wait_stream(compute_stream)
         with torch.cuda.stream(self.copy_stream):
-            self._copy_missing_sync(layer_id)
+            if self._fused_plan is not None:
+                fused_copy_rows(
+                    self._fused_plan,
+                    layer_id,
+                    self.evict_slots,
+                    self.src_indices,
+                    self.num_indices,
+                )
+            else:
+                self._copy_missing_reference(layer_id)
             self.copy_done_event.record(self.copy_stream)
         compute_stream.wait_event(self.copy_done_event)
 
-    def _copy_missing_sync(self, layer_id: int) -> None:
-        """The actual gather, on the current stream.
+    def _copy_missing_reference(self, layer_id: int) -> None:
+        """Host-count gather on the current stream (reference + legacy fallback).
 
-        Phase 1 reads the miss count on the host (a device sync). Correct for
-        eager/piecewise; a device-side fused copy is the CUDA-graph follow-up.
+        Reads the miss count on the host, so it is NOT CUDA-graph capturable. It
+        serves as the CPU-test reference implementation and as the fallback when
+        the device-driven fused copy plan is unavailable.
         """
-        n = int(self.num_indices.item())
-        if n <= 0:
-            return
-        slots = self.evict_slots[:n].to(torch.long)
-        src_idx = self.src_indices[:n].to(torch.long)
-        for per_layer, cache in self.banks:
-            source = per_layer[layer_id]
-            if source.device == self.device:
-                rows = source[src_idx]
-            else:
-                # Host bank: gather the (few) needed rows on the host, then move
-                # them to the device. ``src_idx`` is on the cache device, so bring
-                # it to the source device for the gather.
-                rows = source[src_idx.to(source.device)]
-                rows = rows.to(self.device, non_blocking=self.pin_memory)
-            cache.index_copy_(0, slots, rows)
+        fused_copy_rows_cpu(
+            self.banks,
+            layer_id,
+            self.evict_slots,
+            self.src_indices,
+            self.num_indices,
+        )
 
     # ------------------------------------------------------------------
     # Views / lifecycle

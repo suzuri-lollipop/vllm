@@ -177,10 +177,40 @@ class ExpertCacheOffloader(BaseOffloader):
         total = cache.slot_cache_bytes()
         logger.info(
             "expert_cache offload: %d MoE layers x %d experts, %d GPU slots "
-            "(%s slot cache), host banks %s",
+            "(%s slot cache), host banks %s, miss copy %s",
             num_layers,
             self._num_experts,
             self.cache_size,
             format_gib(total),
             "pinned" if self.pin_memory else "pageable",
+            "fused (device-driven)" if cache._fused_plan is not None else "legacy",
         )
+
+    # ------------------------------------------------------------------
+    # Stream lifecycle / capture hooks (called by the model runner and the
+    # CUDA-graph capture paths via the generic offloader interface)
+    # ------------------------------------------------------------------
+
+    def sync_prev_onload(self) -> None:
+        """Join the miss-copy stream before CUDA-graph capture/replay.
+
+        Ensures any host->device miss copies queued on the copy stream by a
+        previous (eager) forward are complete before the graph is captured or
+        replayed, so captured/recorded work never races in-flight copies.
+        """
+        cache = self.cache
+        if cache is not None and cache.copy_stream is not None:
+            torch.cuda.current_stream().wait_stream(cache.copy_stream)
+
+    def reset_offload_state(self) -> None:
+        """Cold-start the expert slot cache.
+
+        Called around CUDA-graph capture: the dummy forwards run during capture
+        mutate the LRU bookkeeping, so the cache is reset before capture begins
+        and again once capture completes, letting real inference start from a
+        clean (cold) residency state. Mirrors FreeToken's
+        ``GraphRunner._reset_moe_offload_cache``.
+        """
+        cache = self.cache
+        if cache is not None:
+            cache.reset()
