@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
@@ -111,6 +112,12 @@ class InputBatch:
     # a query length this batch's own split does not reach, so attention metadata
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
+
+    # Cudagraph mode the runner will dispatch this batch with (None when the
+    # dispatch decision is not known, e.g. sampler dummy batches). Model states
+    # with pre-dispatch host work (e.g. the Qwen4Exp PLE disk fill) use it to
+    # tell graph replays from eager forwards.
+    cg_mode: CUDAGraphMode | None = None
 
     @classmethod
     def make_dummy(

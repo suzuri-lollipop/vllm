@@ -155,6 +155,13 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def post_dispatch(self) -> None:
+        """Hook run right after the forward was dispatched (every batch, real
+        or dummy). Used to finish pre-dispatch host work that overlaps the
+        forward (e.g. the Qwen4Exp PLE disk flag-sync fill). No-op by default.
+        """
+        return None
+
     @abstractmethod
     def prepare_inputs_embeds(
         self,

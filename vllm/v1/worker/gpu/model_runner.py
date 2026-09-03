@@ -1358,6 +1358,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if adaptive_verification is not None
                 else None
             ),
+            cg_mode=batch_desc.cg_mode,
         )
         return pcp.maybe_partition_pcp_batch(
             self.pcp_manager,
@@ -1620,6 +1621,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
             )
+            input_batch.cg_mode = batch_desc.cg_mode
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
                 if context_len:
@@ -1774,6 +1776,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        # Let model states finish pre-dispatch work that overlaps the forward
+        # (e.g. the Qwen4Exp PLE disk flag-sync fill signals the staged rows
+        # the just-launched graph WAITs on). Not run on launch failure: a
+        # failed launch leaves no pending WAIT (FreeToken's invariant).
+        self.model_state.post_dispatch()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

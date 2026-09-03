@@ -7,11 +7,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+from ..common.ple_disk import PLEDiskStager, resolve_ple_disk_config
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -62,6 +64,22 @@ class Qwen4ExpModelState(MambaHybridModelState):
             device=self.device,
         )
 
+        # Pre-dispatch disk staging (FreeToken's host_fill_batch seam). Built
+        # only for the staged sync modes; "forward" keeps the in-forward
+        # gather. The model is already loaded here, so the layer stores exist.
+        self.ple_disk_stager: PLEDiskStager | None = None
+        disk_config = resolve_ple_disk_config(vllm_config)
+        if disk_config is not None and disk_config.sync_mode != "forward":
+            stager = PLEDiskStager(
+                disk_config,
+                device=self.device,
+                max_num_tokens=self.max_num_tokens,
+                max_num_reqs=self.max_num_reqs,
+                ngram_context_len=self.ngram_context_len,
+            )
+            if stager.attach_model(self.model) > 0:
+                self.ple_disk_stager = stager
+
     def _prepare_ngram_context(
         self,
         input_batch: InputBatch,
@@ -103,11 +121,33 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+
+        stager = getattr(self, "ple_disk_stager", None)
+        if stager is not None:
+            # Stage this forward's rows on the host before dispatch; the fill
+            # reads the tokens back through pinned buffers, so it needs no
+            # scheduler token state. Deferred (post-dispatch) only for FULL
+            # graphs under memops.
+            stager.prepare(
+                input_ids=input_batch.input_ids,
+                num_tokens=input_batch.num_tokens_after_padding,
+                query_start_loc=input_batch.query_start_loc_np,
+                num_reqs=num_reqs_padded,
+                ngram_context=ngram_context,
+                use_graph=input_batch.cg_mode == CUDAGraphMode.FULL,
+            )
         return model_inputs
+
+    def post_dispatch(self) -> None:
+        """Run a deferred disk fill after the forward was dispatched."""
+        stager = getattr(self, "ple_disk_stager", None)
+        if stager is not None:
+            stager.post_dispatch()
 
     def prepare_dummy_inputs(
         self,
@@ -137,6 +177,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+
+        stager = getattr(self, "ple_disk_stager", None)
+        if stager is not None:
+            # Dummy/capture runs still need the staged buffers filled and (for
+            # memops) the flag armed, so the captured WAIT/H2D has valid data.
+            stager.prepare_dummy(num_reqs, num_tokens)
         return model_inputs
 
 

@@ -32,9 +32,8 @@ import json
 import mmap
 import os
 import threading
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -168,6 +167,19 @@ class PLEStreamMemops:
                 "CUDA stream memory ops were rejected; set "
                 'additional_config["ple_disk_sync_mode"]="gate"'
             )
+
+    @staticmethod
+    def signal_flag(flag: torch.Tensor) -> None:
+        """Release-store 1 to a pinned flag once the staged rows have landed.
+
+        Port of FreeToken's ``signal_flag``. The caller must have joined the
+        I/O reads and finished the staging scatter on this thread before
+        calling, so the plain store only has to publish the value to the
+        device-side ``WAIT(flag >= 1)``; on x86 (the consumer target) stores
+        are already release-ordered. The flag is pinned host memory, so the
+        write goes through the ordinary numpy view.
+        """
+        flag.numpy().reshape(-1)[0] = 1
 
     def probe(self, device: torch.device) -> bool:
         """Round-trip a write and a wait to check the driver really allows them."""
@@ -354,8 +366,9 @@ class PLEHostHasher:
             return np.zeros((0, self.ngram_heads), dtype=np.int64)
 
         positions = np.arange(num_tokens, dtype=np.int64)
-        request = np.searchsorted(starts, positions, side="right") - 1
-        np.clip(request, 0, num_reqs - 1, out=request)
+        request: np.ndarray = (
+            np.searchsorted(starts, positions, side="right") - 1
+        ).clip(0, num_reqs - 1)
         columns = positions - starts[request]
         width = context_len + int(columns.max()) + 1
         packed = np.full((num_reqs, width), self.eos_token_id, dtype=np.int64)
@@ -388,7 +401,7 @@ class PLEHostHasher:
 
         shifted = [packed]
         for shift in range(1, self.ngram_size):
-            source = positions - shift
+            source: np.ndarray = positions - shift
             gathered = packed[:, np.clip(source, 0, None)]
             valid = (source[None, :] >= 0) & (in_segment >= shift)
             shifted.append(np.where(valid, gathered, self.eos_token_id))
@@ -696,14 +709,55 @@ class _ReadRun:
     destination_row: int
 
 
+@dataclass
+class StagedRows:
+    """Handle to an in-flight batch of staged reads.
+
+    Returned by [`PLEDiskRowStore.stage`][] and consumed by
+    [`PLEDiskRowStore.wait`][] / [`PLEDiskRowStore.fetch`][] (FreeToken's
+    ``stage`` / ``flush`` split): the reads run on the I/O thread pool while
+    the caller dispatches GPU work.
+    """
+
+    shape: tuple[int, ...]
+    """Shape of the requested row-id tensor (before flattening)."""
+
+    num_unique: int
+    """Number of distinct rows being read; they land in staging rows [0, n)."""
+
+    inverse: torch.Tensor
+    """``[prod(shape)]`` int64 host tensor mapping each requested row to its
+    unique staging row (the dedup fan-out)."""
+
+    pending: list[Future] = field(default_factory=list)
+    done: bool = False
+
+
 class PLEDiskRowStore:
     """Gathers PLE table rows from disk into device memory.
 
     The store is the runtime half of FreeToken's ``PleStore``: duplicate row
     ids collapse to one read, sorted ids coalesce into contiguous reads, and the
     payload lands in a pinned staging buffer that is copied to the device in one
-    shot. The fan-out back to the requested order happens on device, where it is
-    a single `index_select`.
+    shot. The ``gather`` path fans duplicates back out on device with a single
+    `index_select`; the staged sync modes instead scatter the deduplicated rows
+    into request order in pinned memory ([`scatter_ordered`][]) so the forward
+    only does a contiguous fixed-shape H2D copy.
+
+    Batch reader: the I/O fan-out is FreeToken's portable shape — the
+    ``ThreadPoolExecutor`` + ``pread`` pool is exactly the fallback its C++
+    ``BatchReader`` uses when io_uring is unavailable, and fio says the two
+    saturate the same consumer NVMe at ~16 outstanding reads. The port keeps
+    vLLM pure-Python on purpose (no ``csrc``/build-system surface for one
+    model), so the seam is [`_submit_reads`][] returning joinable handles and
+    [`wait`][] draining them. FreeToken's io_uring reader was NOT ported:
+    Python has no stdlib binding, vLLM's only batched-file extension
+    (``vllm.fs_io_C.batch_load_block``) reads whole files rather than offsets
+    inside one, and adding a ``csrc``/liburing build dependency for one model
+    is not worth it here. An io_uring reader (Linux-only, the C++
+    ``IoUringBatchReader`` shape: one submission per coalesced run, no threads,
+    lower per-read CPU on weak cores) would slot behind that same submit/wait
+    pair without touching the hashing, staging or sync machinery.
     """
 
     def __init__(
@@ -716,7 +770,16 @@ class PLEDiskRowStore:
         io_threads: int = DEFAULT_IO_THREADS,
         direct_io: bool = True,
         max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
+        ordered_staging: bool = False,
     ) -> None:
+        """Initialize the store.
+
+        Args:
+            ordered_staging: Allocate the token-ordered pinned buffer the
+                pre-dispatch fill needs ([`scatter_ordered`][] /
+                [`copy_ordered`][]). Only the staged sync modes use it;
+                ``gather``-only stores save the pinned memory.
+        """
         if max_rows <= 0:
             raise ValueError("max_rows must be positive")
         element_size = torch.empty((), dtype=dtype).element_size()
@@ -731,24 +794,50 @@ class PLEDiskRowStore:
         self.max_rows = int(max_rows)
         self.max_read_rows = max(1, max_read_bytes // source.row_stride)
         self._files = [_FileReader(path, direct_io=direct_io) for path in source.paths]
+        # These threads block on I/O rather than compute, but on a weak CPU
+        # more of them than cores is pure context-switch cost, so the pool is
+        # capped by the core count (FreeToken's `min(kReaderThreads,
+        # hardware_concurrency())`).
+        self.io_threads = max(1, min(int(io_threads), os.cpu_count() or 1))
         self._pool = (
-            ThreadPoolExecutor(max_workers=io_threads, thread_name_prefix="ple-disk")
-            if io_threads > 1
+            ThreadPoolExecutor(
+                max_workers=self.io_threads, thread_name_prefix="ple-disk"
+            )
+            if self.io_threads > 1
             else None
         )
         pin = device.type == "cuda" and is_pin_memory_available()
-        self._staging = torch.empty(
+        # Zeroed, not uninitialized: padded graph lanes and the warmup prefill
+        # stage no rows and read whatever sits here, and the PLE prefill conv
+        # packs every request into one conv1d, so an FP8 NaN left in a padded
+        # lane can bleed into a real request's output window.
+        self._staging = torch.zeros(
             (self.max_rows, source.row_bytes), dtype=torch.uint8, pin_memory=pin
         )
-        self._device_rows = torch.empty(
+        self._device_rows = torch.zeros(
             (self.max_rows, source.row_bytes), dtype=torch.uint8, device=device
         )
+        # Pre-dispatch fills land rows in REQUEST order (duplicates expanded),
+        # so the in-graph H2D is one contiguous copy, right-sized per graph
+        # shape by `copy_ordered` (FreeToken keeps separate decode/prefill
+        # buffers for the same effect). Allocated up front; pinned allocation
+        # inside a stream capture is illegal.
+        self._ordered = (
+            torch.zeros(
+                (self.max_rows, source.row_bytes), dtype=torch.uint8, pin_memory=pin
+            )
+            if ordered_staging
+            else None
+        )
+        self._staging_np = self._staging.numpy()
         logger.info_once(
-            "Qwen4Exp PLE disk backend: %d rows over %d file(s), %s I/O, %d thread(s)",
+            "Qwen4Exp PLE disk backend: %d rows over %d file(s), %s I/O, "
+            "%d thread(s), %.1f MiB pinned",
             source.total_rows,
             len(source.paths),
             "direct" if self._files[0].direct_io else "buffered",
-            io_threads,
+            self.io_threads,
+            self._staging.numel() * (2 if self._ordered is not None else 1) / 2**20,
         )
 
     def close(self) -> None:
@@ -862,6 +951,58 @@ class PLEDiskRowStore:
         gathered = rows.index_select(0, staged.inverse.to(self.device))
         return gathered.view(self.dtype).reshape(*staged.shape, self.row_elements)
 
+    def scatter_ordered(self, staged: StagedRows) -> int:
+        """Fan staged rows out into request order in the pinned buffer.
+
+        Joins the reads, then gathers the deduplicated staging rows through
+        ``staged.inverse`` so ``_ordered[i]`` holds the ``i``-th requested row
+        (duplicates expanded, in token order). The device-side consume is then
+        a single contiguous fixed-shape H2D copy, which is what survives CUDA
+        graph capture. Returns the number of ordered rows written.
+        """
+        if self._ordered is None:
+            raise RuntimeError(
+                "the store was created without ordered_staging; staged sync "
+                "modes need ordered_staging=True"
+            )
+        self.wait(staged)
+        total = 1
+        for dim in staged.shape:
+            total *= int(dim)
+        if total > self.max_rows:
+            raise ValueError(
+                f"PLE disk fill needs {total} ordered rows but the store was "
+                f"sized for {self.max_rows}; raise "
+                'additional_config["ple_disk_max_staged_rows"]'
+            )
+        ordered_np = self._ordered.numpy()
+        inverse_np = staged.inverse.numpy().reshape(-1)
+        ordered_np[:total] = self._staging_np[inverse_np]
+        return total
+
+    def copy_ordered(self, num_rows: int) -> torch.Tensor:
+        """Copy the first ``num_rows`` ordered rows to the device.
+
+        The staged-mode lookup: one contiguous pinned->device copy, then a
+        typed view. Capture-safe because both endpoints and the byte count are
+        fixed for a given graph shape.
+        """
+        if self._ordered is None:
+            raise RuntimeError(
+                "the store was created without ordered_staging; staged sync "
+                "modes need ordered_staging=True"
+            )
+        if num_rows > self.max_rows:
+            raise ValueError(
+                f"PLE disk fill copied {num_rows} ordered rows but the store "
+                f"was sized for {self.max_rows}"
+            )
+        device_rows = self._device_rows[:num_rows]
+        device_rows.copy_(
+            self._ordered[:num_rows], non_blocking=self.device.type == "cuda"
+        )
+        return device_rows
+
     def gather(self, row_ids: torch.Tensor) -> torch.Tensor:
         """Read the rows named by ``row_ids`` and return them in that order.
 
@@ -877,13 +1018,344 @@ class PLEDiskRowStore:
 
     @staticmethod
     def assert_not_capturing() -> None:
+        """Reject in-forward gathers during stream capture.
+
+        Only reachable with ``sync_mode="forward"``: the staged modes
+        (``gate`` / ``memops``) read before dispatch and never call
+        [`gather`][], so a capture-time trip here means the in-forward path
+        was captured on purpose or by a FULL graph over a forward-mode store.
+        """
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "The Qwen4Exp PLE disk backend reads from the host and cannot "
-                "read inside a CUDA graph. Stage the rows before dispatch with "
-                'additional_config["ple_disk_sync_mode"]="memops", or keep the '
-                "gather at a piecewise split point (cudagraph_mode=PIECEWISE / "
+                "The Qwen4Exp PLE disk backend was asked to read from the "
+                'host inside a CUDA graph capture; sync_mode="forward" '
+                "cannot be captured. Set "
+                'additional_config["ple_disk_sync_mode"]="memops" (or '
+                '"gate") so rows are staged before dispatch, or keep the '
+                "forward gather out of graphs (cudagraph_mode=PIECEWISE / "
                 "--enforce-eager)."
+            )
+
+
+@dataclass
+class _PLEDiskLayerEntry:
+    """Per-PLE-layer state owned by the stager."""
+
+    hasher: PLEHostHasher
+    store: PLEDiskRowStore
+    flag: torch.Tensor
+    """Pinned int64 flag this layer's captured graph WAITs on (memops)."""
+
+
+@dataclass
+class _PLEDeferredFill:
+    """A fill deferred until after the forward was dispatched (memops)."""
+
+    num_tokens: int
+    query_start_loc: np.ndarray
+    num_reqs: int
+    event: Any
+
+
+class PLEDiskStager:
+    """Pre-dispatch staging for the disk PLE backend.
+
+    Port of the low-spec half of FreeToken's ``DiskRowTable``: rows are hashed
+    and read on the HOST before the forward is dispatched, so the device-side
+    lookup shrinks to a fixed-shape pinned->device copy and never synchronizes
+    inside the forward. That is what makes the lookup capturable into FULL CUDA
+    graphs and what lets the SSD reads overlap the forward instead of stalling
+    it.
+
+    The fill needs this forward's tokens and the per-request n-gram context.
+    Both are staged device-side by the runner's input preparation, so the
+    stager reads them back through pinned buffers + a stream event (FreeToken's
+    decode readback) instead of asking the scheduler to mirror token state:
+
+    * ``gate`` (launch-gating): the readback is awaited and the fill completes
+      before dispatch; the lookup is a plain fixed-shape H2D copy.
+    * ``memops`` (flag-sync): the fill is deferred until after dispatch and the
+      captured lookup starts with ``WAIT(flag >= 1); WRITE(flag, 0)``, so the
+      replay launches immediately and blocks at the PLE consume until the host
+      signals the staged rows. No device-wide sync anywhere. The fill for step
+      N+1 waits step N's readback event, which is ordered after step N's replay
+      on the stream, so one shared staging buffer and one flag per layer can
+      never be overwritten mid-consume (FreeToken's readback-serialization
+      invariant).
+    """
+
+    def __init__(
+        self,
+        config: PLEDiskConfig,
+        *,
+        device: torch.device,
+        max_num_tokens: int,
+        max_num_reqs: int,
+        ngram_context_len: int,
+        memops: PLEStreamMemops | None = None,
+    ) -> None:
+        self.config = config
+        self.device = device
+        self.max_num_tokens = int(max_num_tokens)
+        self.max_num_reqs = int(max_num_reqs)
+        self.ngram_context_len = int(ngram_context_len)
+        self._memops = memops
+        pin = device.type == "cuda" and is_pin_memory_available()
+        self._readback_tokens = torch.zeros(
+            self.max_num_tokens, dtype=torch.int32, pin_memory=pin
+        )
+        self._readback_context = torch.zeros(
+            (self.max_num_reqs, self.ngram_context_len),
+            dtype=torch.int32,
+            pin_memory=pin,
+        )
+        self._readback_event: torch.cuda.Event | None = None
+        self._layers: dict[str, _PLEDiskLayerEntry] = {}
+        self._resolved_mode: str | None = None
+        self._deferred: _PLEDeferredFill | None = None
+        self._host_row_ids: dict[str, np.ndarray] = {}
+
+    # ---- setup ----
+
+    def register_layer(self, layer_name: str, embedding: Any) -> None:
+        """Adopt one PLE layer's hasher, store and (memops) flag."""
+        store = embedding.ngram_embedding.quant_method.store
+        if store._ordered is None:
+            raise RuntimeError(
+                "PLE disk store for "
+                f"{layer_name} has no ordered staging; the staged sync modes "
+                "need the store created with ordered_staging=True"
+            )
+        pin = self.device.type == "cuda" and is_pin_memory_available()
+        flag = torch.zeros(1, dtype=torch.int64, pin_memory=pin)
+        self._layers[layer_name] = _PLEDiskLayerEntry(
+            hasher=PLEHostHasher.from_embedding(embedding),
+            store=store,
+            flag=flag,
+        )
+
+    def attach_model(self, model: nn.Module) -> int:
+        """Find every staged disk PLE layer in ``model`` and adopt it.
+
+        Returns the number of layers attached. Resolves the sync mode eagerly
+        (the memops probe runs stream ops, which must never first run inside a
+        capture).
+        """
+        for module in model.modules():
+            embedding = getattr(module, "ple_embedding", None)
+            if embedding is None or not getattr(embedding, "staged_disk_lookup", False):
+                continue
+            layer_name = embedding.layer_name
+            self.register_layer(layer_name, embedding)
+            embedding._disk_stager = self
+        if self._layers:
+            self.resolve_sync_mode()
+        return len(self._layers)
+
+    def _get_memops(self) -> PLEStreamMemops:
+        if self._memops is None:
+            self._memops = PLEStreamMemops.get()
+        return self._memops
+
+    def resolve_sync_mode(self) -> str:
+        """Resolve ``auto`` once; mirrors FreeToken's ``_probe_wait_sync``."""
+        if self._resolved_mode is not None:
+            return self._resolved_mode
+        mode = self.config.sync_mode
+        memops_ok = self._probe_memops() if mode in ("auto", "memops") else False
+        if mode == "forward":
+            resolved = "forward"
+        elif mode == "gate":
+            resolved = "gate"
+        elif mode == "memops":
+            if not memops_ok:
+                raise RuntimeError(
+                    'ple_disk_sync_mode="memops" was requested but CUDA '
+                    "stream memory ops are unavailable on this device"
+                )
+            resolved = "memops"
+        else:  # auto
+            resolved = "memops" if memops_ok else "gate"
+        if self.config.verify_host_hash and resolved == "memops":
+            raise ValueError(
+                "ple_disk_verify_host_hash needs the host fill to complete "
+                'before the forward; use ple_disk_sync_mode="gate" (or '
+                '"forward"), not memops'
+            )
+        self._resolved_mode = resolved
+        logger.info_once(
+            "Qwen4Exp PLE disk sync: %s (requested %s, memops probe %s)",
+            resolved,
+            mode,
+            "passed" if memops_ok else "unavailable",
+        )
+        return resolved
+
+    def _probe_memops(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        return self._get_memops().probe(self.device)
+
+    @property
+    def sync_mode(self) -> str:
+        if self._resolved_mode is None:
+            raise RuntimeError(
+                "PLE disk sync mode was never resolved; attach_model must run "
+                "before the first forward"
+            )
+        return self._resolved_mode
+
+    @property
+    def verify_host_hash(self) -> bool:
+        return self.config.verify_host_hash
+
+    # ---- host side (model-runner thread, before/after dispatch) ----
+
+    def prepare(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        num_tokens: int,
+        query_start_loc: np.ndarray,
+        num_reqs: int,
+        ngram_context: torch.Tensor,
+        use_graph: bool,
+    ) -> None:
+        """Stage this batch's rows; defer the fill only under memops graphs.
+
+        ``input_ids`` / ``ngram_context`` are the runner's device-side input
+        buffers (already populated for this step); both are read back through
+        pinned buffers so the fill never needs scheduler token state.
+        """
+        if self.sync_mode == "forward" or not self._layers:
+            return
+        cuda = self.device.type == "cuda"
+        self._readback_tokens[:num_tokens].copy_(
+            input_ids[:num_tokens], non_blocking=cuda
+        )
+        self._readback_context[:num_reqs].copy_(
+            ngram_context[:num_reqs], non_blocking=cuda
+        )
+        event = None
+        if cuda:
+            if self._readback_event is None:
+                self._readback_event = torch.cuda.Event()
+            event = self._readback_event
+            event.record(torch.cuda.current_stream(self.device))
+        if use_graph and self.sync_mode == "memops":
+            # Flag-sync: launch first, fill + signal after dispatch.
+            self._deferred = _PLEDeferredFill(
+                num_tokens,
+                np.asarray(query_start_loc, dtype=np.int64),
+                num_reqs,
+                event,
+            )
+            return
+        self._fill(
+            num_tokens, np.asarray(query_start_loc, dtype=np.int64), num_reqs, event
+        )
+
+    def prepare_dummy(self, num_reqs: int, num_tokens: int) -> None:
+        """Synchronous fill for dummy/capture runs (no device readback)."""
+        if self.sync_mode == "forward" or not self._layers:
+            return
+        starts: np.ndarray = np.zeros(num_reqs + 1, dtype=np.int64)
+        if num_reqs > 0:
+            per_req, extra = divmod(num_tokens, num_reqs)
+            lengths: np.ndarray = np.full(num_reqs, per_req, dtype=np.int64)
+            if extra:
+                lengths[-extra:] += 1
+            np.cumsum(lengths, out=starts[1:])
+        self._fill(num_tokens, starts, num_reqs, None)
+
+    def post_dispatch(self) -> None:
+        """Run a deferred fill after the forward was dispatched (memops)."""
+        deferred, self._deferred = self._deferred, None
+        if deferred is None:
+            return
+        try:
+            self._fill(
+                deferred.num_tokens,
+                deferred.query_start_loc,
+                deferred.num_reqs,
+                deferred.event,
+            )
+        except BaseException:
+            # Unblock the stream before surfacing; this step's output is discarded.
+            self._signal_all()
+            raise
+        self._signal_all()
+
+    def _fill(
+        self,
+        num_tokens: int,
+        query_start_loc: np.ndarray,
+        num_reqs: int,
+        event: Any,
+    ) -> None:
+        if event is not None:
+            event.synchronize()
+        tokens = self._readback_tokens[:num_tokens].numpy().astype(np.int64)
+        context = self._readback_context[:num_reqs].numpy().astype(np.int64)
+        staged = []
+        for layer_name, entry in self._layers.items():
+            row_ids = entry.hasher.row_ids(tokens, query_start_loc, context)
+            if self.verify_host_hash:
+                self._host_row_ids[layer_name] = row_ids
+            staged.append(entry.store.stage(row_ids))
+        for entry, handle in zip(self._layers.values(), staged):
+            entry.store.scatter_ordered(handle)
+
+    def _signal_all(self) -> None:
+        memops = self._get_memops()
+        for entry in self._layers.values():
+            memops.signal_flag(entry.flag)
+
+    # ---- device side (inside the forward / captured graph) ----
+
+    def lookup(self, layer_name: str, output: torch.Tensor) -> None:
+        """Serve this layer's rows from staging into ``output``.
+
+        ``output`` is ``[num_tokens, ngram_heads, head_dim]`` in the table
+        dtype. Under a memops capture this emits the flag WAIT/RESET first, so
+        the replayed graph blocks at the consume until the host fill signals.
+        """
+        entry = self._layers[layer_name]
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if capturing and self.sync_mode == "memops":
+            stream = torch.cuda.current_stream(self.device)
+            self._get_memops().wait_and_reset(stream.cuda_stream, entry.flag.data_ptr())
+        num_rows = output.shape[0] * output.shape[1]
+        device_rows = entry.store.copy_ordered(num_rows)
+        output.copy_(device_rows.view(entry.store.dtype).reshape(output.shape))
+
+    def verify_host_ids(self, layer_name: str, device_ids: torch.Tensor) -> None:
+        """Compare device-hashed row ids against the host fill's ids.
+
+        Debug aid (``ple_disk_verify_host_hash``); costs a D2H per forward.
+        Only valid once the fill has landed, i.e. not under memops (rejected at
+        resolution) and not during capture.
+        """
+        host_ids = self._host_row_ids.get(layer_name)
+        if host_ids is None:
+            raise RuntimeError(
+                "verify_host_hash has no host row ids for "
+                f"{layer_name}; the fill must run before the forward"
+            )
+        actual = device_ids.detach().to("cpu", dtype=torch.int64).numpy()
+        expected = host_ids.reshape(actual.shape)
+        if actual.shape != expected.shape:
+            raise RuntimeError(
+                f"verify_host_hash shape mismatch for {layer_name}: device "
+                f"{actual.shape} vs host {expected.shape}"
+            )
+        if not np.array_equal(actual, expected):
+            mismatch = int(np.count_nonzero((actual != expected).any(axis=-1)))
+            raise RuntimeError(
+                f"verify_host_hash: {mismatch}/{len(actual)} tokens of "
+                f"{layer_name} hashed differently on host and device"
             )
 
 
@@ -1041,14 +1513,21 @@ class Qwen4ExpPLEDiskEmbeddingMethod(QuantizeMethodBase):
             self._spool = None
         if self._source is None:
             raise RuntimeError("PLE disk backend has no row source")
+        max_rows = self.max_gathered_rows
+        if self.config.max_staged_rows > 0:
+            max_rows = min(max_rows, self.config.max_staged_rows)
         self._store = PLEDiskRowStore(
             self._source,
             dtype=self.table_dtype,
             device=layer.weight.device,
-            max_rows=self.max_gathered_rows,
+            max_rows=max_rows,
             io_threads=self.config.io_threads,
             direct_io=self.config.direct_io,
             max_read_bytes=self.config.max_read_bytes,
+            # The staged sync modes serve the forward from a token-ordered
+            # pinned buffer filled before dispatch; only "forward" keeps the
+            # gather-in-forward shape.
+            ordered_staging=self.config.sync_mode != "forward",
         )
 
     def apply(
@@ -1060,6 +1539,13 @@ class Qwen4ExpPLEDiskEmbeddingMethod(QuantizeMethodBase):
         raise NotImplementedError("PLE disk weights only support embedding lookup")
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        """Legacy in-forward gather (``sync_mode="forward"`` only).
+
+        The staged sync modes never call this: their rows are filled before
+        dispatch and served by [`PLEDiskStager.lookup`][] through the
+        ``qwen4_exp_lookup_ple_disk_rows`` op, so no D2H sync happens inside
+        the forward.
+        """
         del layer
         return self.store.gather(input_)
 
@@ -1070,9 +1556,13 @@ __all__ = [
     "PAGE_SIZE",
     "PLEDiskConfig",
     "PLEDiskRowStore",
+    "PLEDiskStager",
+    "PLEHostHasher",
     "PLERowSource",
     "PLERowSpool",
+    "PLEStreamMemops",
     "Qwen4ExpPLEDiskEmbeddingMethod",
+    "StagedRows",
     "aligned_span",
     "resolve_ple_disk_config",
 ]

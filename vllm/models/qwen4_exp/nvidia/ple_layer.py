@@ -11,6 +11,7 @@ from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -50,6 +51,8 @@ from ..common.ple_disk import (
     Qwen4ExpPLEDiskEmbeddingMethod,
     resolve_ple_disk_config,
 )
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -356,6 +359,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             else None
         )
         self.gathers_from_disk = disk_method is not None
+        # Staged sync modes (gate/memops/auto) fill rows before dispatch and
+        # serve the forward through a capture-safe fixed-shape copy; only the
+        # legacy "forward" mode keeps the in-forward gather. Decided from the
+        # config string alone so the branch is stable across torch.compile.
+        self.staged_disk_lookup = disk_method is not None and (
+            disk_method.config.sync_mode != "forward"
+        )
+        self._disk_stager = None
         self.table_dtype = None if disk_method is None else disk_method.table_dtype
         self.ngram_embedding = PLEVocabParallelEmbedding(
             padded_vocab_size,
@@ -487,6 +498,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        # The staged path needs the runner-attached stager; without one (unit
+        # tests, runners that skip the model-state hook) fall back to the
+        # legacy in-forward gather so a staged config never hard-fails.
+        if self.staged_disk_lookup and self._disk_stager is not None:
+            return self._lookup_staged_disk_rows(
+                input_ids, query_start_loc, ngram_context
+            )
+        if self.staged_disk_lookup:
+            logger.warning_once(
+                "PLE disk backend is configured for staged sync but no stager "
+                "was attached; falling back to the in-forward gather "
+                "(sync_mode='forward' semantics)"
+            )
         ngram_ids = input_ids.new_empty(
             (input_ids.shape[0], self.ngram_heads),
             dtype=torch.long,
@@ -510,9 +534,61 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         torch.ops.vllm.qwen4_exp_gather_ple_disk_rows(ngram_ids, rows, self.layer_name)
         return rows.flatten(-2)
 
+    def _lookup_staged_disk_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Serve this forward from the pre-dispatch fill.
+
+        No device hash and no D2H: the rows were staged before dispatch and
+        the lookup op is a capture-safe fixed-shape copy, which is what allows
+        full CUDA graph capture under the memops sync mode.
+        """
+        rows = torch.empty(
+            (input_ids.shape[0], self.ngram_heads, self.head_dim),
+            dtype=self.table_dtype,
+            device=input_ids.device,
+        )
+        stager = self._disk_stager
+        if (
+            stager is not None
+            and stager.verify_host_hash
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            # Debug aid only: hash on device too and diff against the host
+            # fill. Costs a D2H, so it never runs unless the knob is on.
+            ngram_ids = input_ids.new_empty(
+                (input_ids.shape[0], self.ngram_heads), dtype=torch.long
+            )
+            torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                ngram_ids,
+                self.layer_name,
+            )
+            stager.verify_host_ids(self.layer_name, ngram_ids)
+        torch.ops.vllm.qwen4_exp_lookup_ple_disk_rows(rows, self.layer_name)
+        return rows.flatten(-2)
+
     def gather_disk_rows(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Read this forward's table rows off disk into ``output``."""
         output.copy_(self.ngram_embedding(ngram_ids))
+
+    def lookup_disk_rows(self, output: torch.Tensor) -> None:
+        """Copy this forward's pre-staged rows into ``output``."""
+        stager = self._disk_stager
+        if stager is None:
+            raise RuntimeError(
+                "Staged PLE disk lookup ran before the runner attached its "
+                "stager; the model state hook (Qwen4ExpModelState) must run "
+                "before the first staged forward"
+            )
+        stager.lookup(self.layer_name, output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -1293,6 +1369,27 @@ def qwen4_exp_gather_ple_disk_rows_fake(
     return
 
 
+def qwen4_exp_lookup_ple_disk_rows(
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Serve pre-staged SSD-resident PLE rows (gate/memops sync modes).
+
+    Takes no data inputs: the rows were hashed and read on the host before
+    dispatch, so the op is a fixed-shape, capture-safe consume and can sit
+    inside a FULL CUDA graph (memops arms the flag WAIT during capture).
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.ple_embedding.lookup_disk_rows(output)
+
+
+def qwen4_exp_lookup_ple_disk_rows_fake(
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1324,6 +1421,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_gather_ple_disk_rows,
     mutates_args=["output"],
     fake_impl=qwen4_exp_gather_ple_disk_rows_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_lookup_ple_disk_rows",
+    op_func=qwen4_exp_lookup_ple_disk_rows,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_lookup_ple_disk_rows_fake,
 )
 
 

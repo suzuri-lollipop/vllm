@@ -770,6 +770,7 @@ class CompilationConfig:
         "vllm::short_conv",
         "vllm::qwen4_exp_compute_ple_ngram_ids",
         "vllm::qwen4_exp_gather_ple_disk_rows",
+        "vllm::qwen4_exp_lookup_ple_disk_rows",
         "vllm::qwen4_exp_ple_short_conv",
         "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",
