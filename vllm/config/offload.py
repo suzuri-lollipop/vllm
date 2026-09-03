@@ -107,6 +107,15 @@ class ExpertCacheOffloadConfig:
     where CUDA pinning is unavailable (miss copies then go through pageable
     staging and the feature is not supported on the GPU path)."""
 
+    moe_prefill_overlap: bool = True
+    """Double-buffered prefill expert streaming: the first 2*num_experts slot
+    cache entries are borrowed as two per-bank double buffers, and each MoE
+    layer's whole expert layer is prefetched on a dedicated copy stream while
+    the previous layer's GEMMs run (mirrors FreeToken's
+    --disable-moe-prefill-overlap, default enabled). Requires
+    moe_cache_size >= 2 * num_experts; otherwise the cache degrades to the
+    synchronous materialize prefill path (logged once)."""
+
 
 @config
 class OffloadConfig:

@@ -542,6 +542,7 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     moe_cache_size: int = ExpertCacheOffloadConfig.moe_cache_size
     moe_cache_pin_memory: bool = ExpertCacheOffloadConfig.moe_cache_pin_memory
+    moe_prefill_overlap: bool = ExpertCacheOffloadConfig.moe_prefill_overlap
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1324,6 +1325,9 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--moe-cache-pin-memory", **expert_cache_kwargs["moe_cache_pin_memory"]
+        )
+        offload_group.add_argument(
+            "--moe-prefill-overlap", **expert_cache_kwargs["moe_prefill_overlap"]
         )
 
         # Multimodal related configs
@@ -2551,6 +2555,7 @@ class EngineArgs:
             expert_cache=ExpertCacheOffloadConfig(
                 moe_cache_size=self.moe_cache_size,
                 moe_cache_pin_memory=self.moe_cache_pin_memory,
+                moe_prefill_overlap=self.moe_prefill_overlap,
             ),
         )
 

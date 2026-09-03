@@ -89,15 +89,42 @@ def _offload_forward(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
+    # Double-buffered prefill streams the whole expert layer into a borrowed
+    # buffer and computes the GEMM over a buffer view offset by buffer_id * E.
+    # That is only correct when the GEMM has no per-row weight-scale bank read by
+    # expert id: such scales live in the fixed slot-scale cache at expert ids
+    # [0:E) and cannot follow the buffer_id * E weight offset (buffer 1 would
+    # read buffer 0's scales). So overlap is restricted to scale-free formats
+    # (bf16); formats with scale banks (fp8_block, ...) prefill via materialize.
+    has_scale_banks = any("scale" in name for name in cache.bank_schema)
+
+    overlap_prefill = False
     if _batch_is_prefill():
-        # Simple synchronous prefill path: materialize the whole expert layer into
-        # the first num_experts slots (position == expert id) and compute. Routing
-        # ids pass through unmapped.
-        cache.materialize_layer(layer_id)
-        cache.copy_missing()
-        w13 = cache.bank_caches["w13"][: cache.num_experts]
-        w2 = cache.bank_caches["w2"][: cache.num_experts]
-        num_local = cache.num_experts
+        if cache.prefill_overlap and not has_scale_banks:
+            # Double-buffered streaming prefill: the first MoE layer opens the
+            # batch; every layer prefetches itself and its successor into
+            # alternating borrowed buffers, waits its buffer, computes over it
+            # (position == expert id, routing ids unmapped), then releases it.
+            overlap_prefill = True
+            if layer_id == 0:
+                cache.begin_prefill()
+            cache.prefetch_prefill_layer(layer_id)
+            cache.prefetch_prefill_layer(layer_id + 1)
+            views = cache.wait_prefill_layer(layer_id)
+            w13 = views[cache.bank_schema.index("w13")]
+            w2 = views[cache.bank_schema.index("w2")]
+            num_local = cache.num_experts
+        else:
+            # Synchronous materialize of the whole expert layer into the first
+            # num_experts slots (position == expert id), routing ids unmapped.
+            # Used when overlap is disabled, when the cache is too small to lend
+            # two buffers (degraded mode), or when the format banks per-row
+            # scales (see has_scale_banks above).
+            cache.materialize_layer(layer_id)
+            cache.copy_missing()
+            w13 = cache.bank_caches["w13"][: cache.num_experts]
+            w2 = cache.bank_caches["w2"][: cache.num_experts]
+            num_local = cache.num_experts
     else:
         # Decode: LRU-ensure the routed experts, streaming only the misses.
         # ``ensure_experts`` rewrites ``topk_ids`` in place to slot ids.
@@ -110,7 +137,7 @@ def _offload_forward(
     assert method.moe_kernel is not None
     # Shared experts (if any) are executed by the runner; the offload path only
     # produces the routed output.
-    return method.moe_kernel.apply(
+    out = method.moe_kernel.apply(
         hidden_states=x,
         w1=w13,
         w2=w2,
@@ -123,6 +150,9 @@ def _offload_forward(
         shared_experts=None,
         shared_experts_input=None,
     )
+    if overlap_prefill:
+        cache.release_prefill_layer(layer_id)
+    return out
 
 
 class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -311,9 +341,16 @@ def _batch_is_prefill() -> bool:
     """Best-effort detection that the current batch has a prefill/mixed sequence.
 
     Returns True when the forward-context batch descriptor reports strictly more
-    tokens than requests (query_len > 1 somewhere). When the descriptor is absent
-    or does not carry a request count (the common eager/piecewise case), returns
-    False and the always-correct ensure path is used.
+    tokens than requests (query_len > 1 somewhere), selecting the prefill path
+    (double-buffered streaming when overlap is enabled, else synchronous
+    materialize). When the descriptor is absent or does not carry a request
+    count, returns False and the always-correct decode ensure path is used.
+
+    The request count is populated on the eager (CUDAGraphMode.NONE) batch
+    descriptor; it stays None on the piecewise descriptor, which doubles as a
+    CUDA-graph cache key and must not specialize on num_reqs, so piecewise
+    prefill conservatively uses the decode path. This gate therefore controls
+    when the prefill overlap buffers are exercised.
     """
     try:
         from vllm.forward_context import get_forward_context

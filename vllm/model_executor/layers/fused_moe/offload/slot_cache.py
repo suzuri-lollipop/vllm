@@ -93,6 +93,10 @@ class ExpertSlotCache:
         quant_format: bank layout key into ``BANK_SCHEMAS`` (bf16 only today).
         pin_memory: whether host banks are page-locked (required for fast async
             H2D miss copies).
+        prefill_overlap: double-buffered prefill streaming (borrows the first
+            ``2 * num_experts`` slots as two per-bank prefetch buffers). Degrades
+            to the synchronous materialize path, with a one-time log, when
+            ``cache_size < 2 * num_experts``.
     """
 
     num_layers: int
@@ -101,6 +105,7 @@ class ExpertSlotCache:
     device: torch.device
     quant_format: str = "bf16"
     pin_memory: bool = True
+    prefill_overlap: bool = True
 
     def __post_init__(self) -> None:
         assert self.quant_format in BANK_SCHEMAS, (
@@ -110,6 +115,17 @@ class ExpertSlotCache:
             raise ValueError(
                 f"cache_size {self.cache_size} < num_experts {self.num_experts}"
             )
+        # The double buffers borrow one full expert layer each, so they need
+        # >= 2 * num_experts slots; degrade to the synchronous materialize path
+        # (loudly, so a user who asked for overlap sees it) when too small.
+        if self.prefill_overlap and self.cache_size < 2 * self.num_experts:
+            logger.warning_once(
+                "expert_cache prefill overlap needs cache_size >= 2 * "
+                f"num_experts ({2 * self.num_experts}); cache_size "
+                f"{self.cache_size} falls back to the synchronous materialize "
+                "prefill path."
+            )
+            self.prefill_overlap = False
 
         dev = self.device
         # Device-side LRU bookkeeping (flat id space: id = layer * E + expert).
@@ -157,6 +173,20 @@ class ExpertSlotCache:
         # set_bank_sources); None -> legacy host-count copy fallback.
         self._fused_plan: FusedCopyPlan | None = None
 
+        # Double-buffered prefill streaming state. The first 2 * num_experts
+        # slots are borrowed as two per-bank buffers ([2, E, ...]); populated by
+        # _init_prefill_overlap_buffers once the banks are registered.
+        self.prefill_bank_buffers: list[torch.Tensor] = []
+        self.prefill_copy_stream: torch.cuda.Stream | None = None
+        self.prefill_begin_event: torch.cuda.Event | None = None
+        self.prefill_ready_events: list[torch.cuda.Event] = []
+        self.prefill_release_events: list[torch.cuda.Event] = []
+        # Per buffer: the layer currently held, whether it has been released by
+        # the compute side, and whether a release event has been recorded.
+        self._prefill_buffer_layer: list[int | None] = [None, None]
+        self._prefill_buffer_released: list[bool] = [True, True]
+        self._prefill_buffer_has_release_event: list[bool] = [False, False]
+
     # ------------------------------------------------------------------
     # Bank registration
     # ------------------------------------------------------------------
@@ -201,6 +231,9 @@ class ExpertSlotCache:
         # Slot-cache allocations are now fixed: build the device-driven fused
         # miss-copy descriptors (None -> legacy host-count copy fallback).
         self._fused_plan = build_fused_copy_plan(self)
+        # The slot caches now exist: borrow the prefill double buffers.
+        if self.prefill_overlap:
+            self._init_prefill_overlap_buffers()
 
     # ------------------------------------------------------------------
     # Geometry / budget helpers
@@ -304,6 +337,134 @@ class ExpertSlotCache:
         )
 
     # ------------------------------------------------------------------
+    # Double-buffered prefill streaming
+    # ------------------------------------------------------------------
+    #
+    # The first ``2 * num_experts`` slots of every bank's slot cache are borrowed
+    # as two per-bank double buffers (one whole expert layer each). During a
+    # prefill batch each MoE layer's full expert layer is streamed into an
+    # alternating buffer on ``prefill_copy_stream`` while the previous layer's
+    # GEMMs run on the compute stream; ``position == expert id`` inside a buffer,
+    # so routing ids pass through unmapped (the same placement as
+    # ``materialize_layer``). Hit-D2D splitting is NOT implemented (needs
+    # cudaMemcpyBatchAsync, CUDA 12.8+) -- the whole layer is always copied.
+
+    def _init_prefill_overlap_buffers(self) -> None:
+        assert self.banks, "set_bank_sources must register the banks first"
+        self._prefill_buffer_layer = [None, None]
+        self._prefill_buffer_released = [True, True]
+        self._prefill_buffer_has_release_event = [False, False]
+        self.prefill_bank_buffers = [
+            cache[: 2 * self.num_experts].view(2, self.num_experts, *cache.shape[1:])
+            for _, cache in self.banks
+        ]
+        if self.device.type == "cuda":
+            self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
+            self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
+            self.prefill_release_events = [torch.cuda.Event() for _ in range(2)]
+            self.prefill_begin_event = torch.cuda.Event()
+
+    def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
+        """Drop LRU residency for a borrowed buffer's slots and age them to the
+        front of the eviction queue (usage=0) so decode reclaims them first."""
+        slot_start = buffer_id * self.num_experts
+        slot_end = slot_start + self.num_experts
+        old_ids = self.id_of_slot[slot_start:slot_end]
+        self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
+        old_ids.fill_(-1)
+        self.usage[slot_start:slot_end].zero_()
+
+    def begin_prefill(self) -> None:
+        """Start a prefill batch: reset buffer tracking and fence the copy stream
+        behind everything already enqueued on the compute stream.
+
+        The per-buffer ready/release events only order against the *previous*
+        prefill; a new prefill can be enqueued while the preceding decode batch
+        still reads experts that live in the borrowed slots, so without this fence
+        the first prefetch could overwrite bytes a running decode GEMM is reading.
+        """
+        if not self.prefill_overlap:
+            return
+        self._prefill_buffer_layer = [None, None]
+        self._prefill_buffer_released = [True, True]
+        if self.prefill_copy_stream is not None:
+            assert self.prefill_begin_event is not None
+            self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
+            self.prefill_copy_stream.wait_event(self.prefill_begin_event)
+
+    def prefetch_prefill_layer(self, layer_id: int) -> None:
+        """Queue the whole-layer copy for ``layer_id`` into its buffer.
+
+        Idempotent: re-prefetching the layer already in its buffer is a no-op.
+        Reusing a buffer that still holds an unreleased layer is a bug (the
+        producer must ``release_prefill_layer`` before the buffer's next tenant).
+        """
+        if not self.prefill_overlap or layer_id >= self.num_layers:
+            return
+        if layer_id < 0:
+            raise ValueError(f"Invalid prefill layer id: {layer_id}")
+
+        assert self.banks and self.prefill_bank_buffers
+
+        buffer_id = layer_id % 2
+        if self._prefill_buffer_layer[buffer_id] == layer_id:
+            return
+        if self._prefill_buffer_layer[buffer_id] is not None:
+            assert self._prefill_buffer_released[buffer_id], (
+                "Prefill overlap buffer is being reused before release"
+            )
+
+        def copy() -> None:
+            self._invalidate_prefill_buffer(buffer_id)
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+
+        if self.prefill_copy_stream is None:
+            # CPU (tests): synchronous copy on the current stream.
+            copy()
+        else:
+            with torch.cuda.stream(self.prefill_copy_stream):
+                if self._prefill_buffer_has_release_event[buffer_id]:
+                    # The previous tenant's GEMMs must finish before overwrite.
+                    self.prefill_copy_stream.wait_event(
+                        self.prefill_release_events[buffer_id]
+                    )
+                copy()
+                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+        self._prefill_buffer_layer[buffer_id] = layer_id
+        self._prefill_buffer_released[buffer_id] = False
+
+    def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Block the compute stream until ``layer_id``'s buffer is ready, then
+        return the per-bank ``[num_experts, ...]`` buffer views (schema order)."""
+        assert self.prefill_overlap
+        assert self.prefill_bank_buffers
+        self.prefetch_prefill_layer(layer_id)
+        buffer_id = layer_id % 2
+        assert self._prefill_buffer_layer[buffer_id] == layer_id
+        if self.prefill_ready_events:
+            torch.cuda.current_stream(self.device).wait_event(
+                self.prefill_ready_events[buffer_id]
+            )
+        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
+
+    def release_prefill_layer(self, layer_id: int) -> None:
+        """Mark ``layer_id``'s buffer free after its GEMMs; records a release
+        event on the compute stream that the buffer's next prefetch waits on."""
+        if not self.prefill_overlap:
+            return
+        buffer_id = layer_id % 2
+        if self._prefill_buffer_layer[buffer_id] != layer_id:
+            return
+        if self.prefill_release_events:
+            self.prefill_release_events[buffer_id].record(
+                torch.cuda.current_stream(self.device)
+            )
+            self._prefill_buffer_has_release_event[buffer_id] = True
+        self._prefill_buffer_released[buffer_id] = True
+
+    # ------------------------------------------------------------------
     # Views / lifecycle
     # ------------------------------------------------------------------
 
@@ -316,12 +477,21 @@ class ExpertSlotCache:
         return tuple(cache[:n] for _, cache in self.banks)
 
     def reset(self) -> None:
-        """Cold-start the cache (drop all residency)."""
+        """Cold-start the cache (drop all residency).
+
+        Also resets the prefill buffer tracking: ``reset_cache`` already clears
+        every slot (including the borrowed ones), so the buffers are logically
+        empty afterwards; the tenant/release flags must agree with that. Used by
+        the CUDA-graph capture hook so capture cannot observe stale prefill state.
+        """
         from vllm.model_executor.layers.fused_moe.offload.lru import reset_cache
 
         reset_cache(self)
         self._pending_src_layer = None
         self._pending_whole_layer = False
+        self._prefill_buffer_layer = [None, None]
+        self._prefill_buffer_released = [True, True]
+        self._prefill_buffer_has_release_event = [False, False]
 
 
 # ---------------------------------------------------------------------------

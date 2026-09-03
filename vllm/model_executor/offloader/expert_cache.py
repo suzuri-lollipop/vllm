@@ -49,16 +49,19 @@ class ExpertCacheOffloader(BaseOffloader):
     Args:
         cache_size: number of expert slots in the global GPU slot cache.
         pin_memory: page-lock the host banks (required for fast async H2D).
-        quant_format: bank layout key (only "bf16" is supported in phase 1).
+        prefill_overlap: enable double-buffered prefill expert streaming
+            (degrades to synchronous materialize when cache_size < 2*experts).
     """
 
     def __init__(
         self,
         cache_size: int,
         pin_memory: bool = True,
+        prefill_overlap: bool = True,
     ):
         self.cache_size = cache_size
         self.pin_memory = pin_memory and is_pin_memory_available()
+        self.prefill_overlap = prefill_overlap
         # Bank layout, detected from the first diverted layer's quant method
         # ("bf16" or "fp8_block") and required to be uniform across layers.
         self.quant_format: str | None = None
@@ -183,6 +186,7 @@ class ExpertCacheOffloader(BaseOffloader):
             device=device,
             quant_format=self.quant_format,
             pin_memory=self.pin_memory,
+            prefill_overlap=self.prefill_overlap,
         )
         # sources[name] -> list of per-layer host tensors.
         sources: dict[str, list[torch.Tensor]] = {

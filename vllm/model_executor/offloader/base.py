@@ -190,6 +190,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
         return ExpertCacheOffloader(
             cache_size=expert_cache.moe_cache_size,
             pin_memory=expert_cache.moe_cache_pin_memory,
+            prefill_overlap=expert_cache.moe_prefill_overlap,
         )
     else:
         return NoopOffloader()

@@ -1034,3 +1034,216 @@ def test_fp8_fused_copy_plan_built_on_cuda():
     assert plan is not None
     assert plan.num_banks == 4
     assert sorted(plan.feat_bytes.tolist()) == sorted(cache.bank_row_bytes().values())
+
+
+# ---------------------------------------------------------------------------
+# Double-buffered prefill streaming (state machine, CPU reference)
+# ---------------------------------------------------------------------------
+#
+# On a CPU cache ``prefill_copy_stream`` is None, so the prefetch copy runs
+# synchronously on the current stream -- exercising the exact buffer alternation,
+# invalidation and release/re-borrow bookkeeping without a device.
+
+
+def _make_overlap_cache(num_layers: int = 4, num_experts: int = 4):
+    cache = make_cache(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=2 * num_experts,  # exactly enough for the two buffers
+        device=CPU,
+    )
+    assert cache.prefill_overlap
+    assert len(cache.prefill_bank_buffers) == len(cache.bank_schema)
+    return cache
+
+
+def test_prefill_overlap_buffers_borrow_first_2e_slots():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    for name, buffer in zip(cache.bank_schema, cache.prefill_bank_buffers):
+        slot_cache = cache.bank_caches[name]
+        # The buffer is a [2, E, ...] view over the first 2E slots.
+        assert buffer.shape == (2, 4, *slot_cache.shape[1:])
+        assert buffer.data_ptr() == slot_cache.data_ptr()
+
+
+def test_prefill_overlap_alternation_and_contents():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+    assert cache._prefill_buffer_layer == [0, 1]
+
+    v0 = cache.wait_prefill_layer(0)
+    v1 = cache.wait_prefill_layer(1)
+    for name_idx, name in enumerate(cache.bank_schema):
+        # position == expert id: the buffer rows ARE the layer's expert rows.
+        assert torch.equal(v0[name_idx], cache.bank_sources[name][0])
+        assert torch.equal(v1[name_idx], cache.bank_sources[name][1])
+
+
+def test_prefill_overlap_reuse_before_release_is_rejected():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)  # buffer 0 <- layer 0
+    cache.prefetch_prefill_layer(1)  # buffer 1 <- layer 1
+    # Layer 2 maps to buffer 0, which still holds unreleased layer 0.
+    with pytest.raises(AssertionError, match="before release"):
+        cache.prefetch_prefill_layer(2)
+    # After release, the re-borrow succeeds and carries layer 2's rows.
+    cache.release_prefill_layer(0)
+    assert cache._prefill_buffer_released[0] is True
+    cache.prefetch_prefill_layer(2)
+    assert cache._prefill_buffer_layer == [2, 1]
+    v2 = cache.wait_prefill_layer(2)
+    for name_idx, name in enumerate(cache.bank_schema):
+        assert torch.equal(v2[name_idx], cache.bank_sources[name][2])
+
+
+def test_prefill_overlap_invalidates_borrowed_slots():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    # Make layer-0 experts resident in the to-be-borrowed slots [0..4).
+    lru_ensure_cpu(cache, 0, torch.tensor([0, 1, 2, 3], dtype=torch.int32))
+    assert torch.all(cache.slot_for_id[0] >= 0)
+    assert torch.all(cache.usage[:4] == 1)
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)  # borrows slots [0..4)
+    # Residency dropped and usage zeroed so decode evicts these slots first.
+    assert torch.all(cache.id_of_slot[:4] == -1)
+    assert torch.all(cache.slot_for_id[0] == -1)
+    assert torch.all(cache.usage[:4] == 0)
+
+
+def test_prefill_overlap_begin_resets_tracking():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    assert cache._prefill_buffer_layer[0] == 0
+    assert cache._prefill_buffer_released[0] is False
+    # A new prefill batch clears the tenant/release tracking.
+    cache.begin_prefill()
+    assert cache._prefill_buffer_layer == [None, None]
+    assert cache._prefill_buffer_released == [True, True]
+
+
+def test_prefill_overlap_prefetch_is_idempotent_and_bounds_checked():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(0)  # already resident -> no-op
+    assert cache._prefill_buffer_layer[0] == 0
+    cache.prefetch_prefill_layer(cache.num_layers)  # >= num_layers -> no-op
+    with pytest.raises(ValueError, match="Invalid prefill layer id"):
+        cache.prefetch_prefill_layer(-1)
+
+
+def test_prefill_overlap_degrades_when_cache_too_small():
+    # cache_size == num_experts < 2*num_experts -> overlap must disable itself.
+    cache = make_cache(num_layers=2, num_experts=4, cache_size=4, device=CPU)
+    assert cache.prefill_overlap is False
+    assert cache.prefill_bank_buffers == []
+    assert cache.prefill_copy_stream is None
+
+
+def test_prefill_overlap_eligibility_by_format():
+    """Overlap prefill is only valid for scale-free formats: the GEMM reads
+    per-row weight scales by expert id from the fixed slot-scale cache, which
+    cannot follow the buffer_id*E weight offset of the alternating buffers."""
+    bf16_cache = _make_overlap_cache(num_layers=2, num_experts=4)
+    assert not any("scale" in n for n in bf16_cache.bank_schema)
+
+    fp8_cache = _make_fp8_cache(num_experts=4, cache_size=8)
+    assert any("scale" in n for n in fp8_cache.bank_schema)
+
+
+def test_prefill_overlap_disabled_by_config():
+    cache = ExpertSlotCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=CPU,
+        prefill_overlap=False,
+    )
+    cache.set_bank_sources(
+        {
+            "w13": [torch.randn(4, 2 * INTER, HIDDEN) for _ in range(2)],
+            "w2": [torch.randn(4, HIDDEN, INTER) for _ in range(2)],
+        }
+    )
+    assert cache.prefill_overlap is False
+    assert cache.prefill_bank_buffers == []
+    # begin/prefetch/wait/release are all no-ops (or guarded) when disabled.
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.release_prefill_layer(0)
+
+
+def test_prefill_overlap_config_and_offloader_wiring():
+    from vllm.config import ExpertCacheOffloadConfig, OffloadConfig
+
+    cfg = ExpertCacheOffloadConfig(moe_cache_size=64)
+    assert cfg.moe_prefill_overlap is True  # default on
+
+    off = create_offloader(
+        OffloadConfig(
+            offload_backend="expert_cache",
+            expert_cache=ExpertCacheOffloadConfig(
+                moe_cache_size=64, moe_prefill_overlap=False
+            ),
+        )
+    )
+    assert off.prefill_overlap is False
+    off2 = create_offloader(
+        OffloadConfig(
+            offload_backend="expert_cache",
+            expert_cache=ExpertCacheOffloadConfig(moe_cache_size=64),
+        )
+    )
+    assert off2.prefill_overlap is True
+
+
+def test_reset_clears_prefill_tracking():
+    cache = _make_overlap_cache(num_layers=4, num_experts=4)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    assert cache._prefill_buffer_layer[0] == 0
+    cache.reset()
+    assert cache._prefill_buffer_layer == [None, None]
+    assert cache._prefill_buffer_released == [True, True]
+    assert cache._prefill_buffer_has_release_event == [False, False]
+
+
+@pytest.mark.skipif(not _CUDA_AND_TRITON, reason="requires CUDA + Triton")
+def test_prefill_overlap_cuda_stream_and_events():
+    dev = torch.device("cuda")
+    num_experts = 4
+    cache = ExpertSlotCache(
+        num_layers=4,
+        num_experts=num_experts,
+        cache_size=2 * num_experts,
+        device=dev,
+    )
+    sources = {
+        "w13": [
+            torch.randn(num_experts, 2 * INTER, HIDDEN).pin_memory() for _ in range(4)
+        ],
+        "w2": [torch.randn(num_experts, HIDDEN, INTER).pin_memory() for _ in range(4)],
+    }
+    cache.set_bank_sources(sources)
+    assert cache.prefill_copy_stream is not None
+    assert cache.prefill_begin_event is not None
+    assert len(cache.prefill_ready_events) == 2
+    assert len(cache.prefill_release_events) == 2
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+    v0 = cache.wait_prefill_layer(0)
+    v1 = cache.wait_prefill_layer(1)
+    torch.cuda.synchronize()
+    for name_idx, name in enumerate(cache.bank_schema):
+        assert torch.equal(v0[name_idx].cpu(), cache.bank_sources[name][0])
+        assert torch.equal(v1[name_idx].cpu(), cache.bank_sources[name][1])
+    cache.release_prefill_layer(0)
+    cache.release_prefill_layer(1)
+    assert cache._prefill_buffer_has_release_event == [True, True]
