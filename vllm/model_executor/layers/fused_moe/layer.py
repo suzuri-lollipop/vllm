@@ -89,6 +89,7 @@ def _maybe_offload_routed_experts_cls(
     vllm_config,
     moe_parallel_config: "FusedMoEParallelConfig",
     enable_eplb: bool,
+    layer_name: str,
 ) -> type[RoutedExperts]:
     """Return the expert-cache offload ``RoutedExperts`` subclass when applicable.
 
@@ -104,6 +105,13 @@ def _maybe_offload_routed_experts_cls(
     banks only ``num_local_experts``, ``_offload_forward`` maps global routing
     ids through ``expert_map`` before touching the slot cache, and MoERunner's
     final all-reduce sums the per-rank partials.
+
+    ``moe_gpu_resident_layers`` splits residency between VRAM and host RAM:
+    layers below that index keep the ordinary non-offloaded experts (so they
+    never leave VRAM and never cost host RAM), and only the layers above it
+    are banked. Expert parallelism halves what each rank holds but not what
+    the host holds in total, so a model whose experts exceed host RAM outright
+    needs some of them to stay resident on the GPUs.
     """
     offload_config = getattr(vllm_config, "offload_config", None)
     if offload_config is None or offload_config.offload_backend != "expert_cache":
@@ -142,6 +150,20 @@ def _maybe_offload_routed_experts_cls(
             "to the default (non-offloaded) routed experts."
         )
         return RoutedExperts
+
+    resident_layers = offload_config.expert_cache.moe_gpu_resident_layers
+    if resident_layers > 0:
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        layer_index = extract_layer_index(layer_name)
+        if layer_index < resident_layers:
+            logger.debug_once(
+                "expert_cache offload: keeping the experts of the first %d "
+                "layers GPU-resident; layer %d is not banked.",
+                resident_layers,
+                layer_index,
+            )
+            return RoutedExperts
 
     from vllm.model_executor.layers.fused_moe.offload.routed_experts import (
         OffloadRoutedExperts,
@@ -426,7 +448,7 @@ def FusedMoEFactory(
     # This will hold all expert weight parameters
     if routed_experts_cls is None:
         routed_experts_cls = _maybe_offload_routed_experts_cls(
-            vllm_config, moe_parallel_config, enable_eplb
+            vllm_config, moe_parallel_config, enable_eplb, layer_name
         )
 
     assert params_dtype is not None

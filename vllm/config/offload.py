@@ -101,6 +101,17 @@ class ExpertCacheOffloadConfig:
     offload_backend is "expert_cache". Rule of thumb: size it so that
     slots * per-expert-bytes fills the VRAM left over after weights/KV."""
 
+    moe_gpu_resident_layers: int = Field(default=0, ge=0)
+    """Split expert residency between VRAM and host RAM: MoE layers whose
+    decoder index is below this value keep the ordinary non-offloaded experts
+    (permanently in VRAM, costing no host RAM), and only the layers at or
+    above it get host banks and go through the slot cache. Use this when the
+    expert set does not fit in host RAM either -- expert parallelism halves
+    what each rank banks but not the total, so some experts have to stay
+    resident. Pick the largest value whose resident experts still leave room
+    for the remaining weights, the slot cache and the KV cache. 0 (default)
+    offloads every MoE layer."""
+
     moe_cache_pin_memory: bool = True
     """Pin the host expert banks (page-locked CPU memory). Pinning is
     required for the async host->device miss copies; disable only on hosts

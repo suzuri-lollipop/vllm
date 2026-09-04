@@ -94,16 +94,33 @@ def _offload_forward(
 
     # Expert parallelism: the router emits GLOBAL expert ids, but this rank
     # banks only its own shard of the experts (create_weights is handed
-    # num_local_experts), so translate to local ids up front -- ``expert_map``
-    # yields -1 for an expert another rank owns, which every path below (LRU
-    # ensure, materialize, and the fused kernels) treats as "contribute
-    # nothing". Each rank therefore computes a partial sum and MoERunner's
-    # final all-reduce (ep_size > 1) combines them. Doing it here rather than
-    # passing expert_map down is what keeps the ids in slot space for the
-    # kernel, exactly as in the non-EP case.
+    # num_local_experts), so translate to local ids up front. Doing it here
+    # rather than passing expert_map down is what keeps the ids in slot space
+    # for the kernel, exactly as in the non-EP case; each rank then computes a
+    # partial sum and MoERunner's final all-reduce (ep_size > 1) combines them.
+    #
+    # ``expert_map`` yields -1 for an expert another rank owns. A raw -1 must
+    # NOT reach the GEMM: this path always calls the kernel with
+    # ``expert_map=None``, so nothing downstream applies the "-1 means skip"
+    # convention -- the prefill branch materializes the layer so that
+    # position == expert id, and the decode branch's LRU leaves ids it did not
+    # rewrite untouched. Feeding -1 in as an index is what produced fluent but
+    # meaningless output on real hardware, since under ep_size=2 roughly half
+    # of all routings are non-local.
+    #
+    # Instead, neutralize those routings by zeroing their router weight and
+    # clamping the id to a valid expert. The clamped expert is still computed
+    # but contributes exactly zero (the weight multiplies its output, or its
+    # input under apply_router_weight_on_input), and the owning rank
+    # contributes that expert with its proper weight, so the all-reduced sum
+    # is exact. This is also kernel-agnostic, which matters because the slot
+    # GEMM is chosen per quant format.
     expert_map = layer.expert_map
     if expert_map is not None:
-        topk_ids = expert_map[topk_ids.long()].to(torch.int32)
+        local_ids = expert_map[topk_ids.long()]
+        non_local = local_ids < 0
+        topk_ids = local_ids.masked_fill(non_local, 0).to(torch.int32)
+        topk_weights = topk_weights.masked_fill(non_local, 0)
 
     # Double-buffered prefill streams the whole expert layer into a borrowed
     # buffer and computes the GEMM over a buffer view offset by buffer_id * E.

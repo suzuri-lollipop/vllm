@@ -158,21 +158,48 @@ class ExpertCacheOffloader(BaseOffloader):
         self._layer_banks.append(banks)
 
     def _to_host_bank(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Move a weight tensor to (optionally pinned) host memory."""
-        host = tensor.detach().to("cpu")
-        if self.pin_memory:
-            # device="cpu" is load-bearing: diversion runs inside the model's
-            # construction device context (`with target_device`), whose
-            # torch_function mode fills in `device=cuda` for any factory call
-            # that does not name one. empty_like would then be asked for
-            # pinned memory *on the GPU*, which fails as
-            # "CUDA error: out of memory" no matter how much host RAM is free
-            # -- confirmed on real hardware, where pinning 36 GiB outside a
-            # device context succeeded while 16 GiB inside one did not.
-            pinned = torch.empty_like(host, device="cpu", pin_memory=True)
-            pinned.copy_(host)
-            host = pinned
-        return host.contiguous()
+        """Move a weight tensor to pageable host memory.
+
+        Page-locking is deferred to :meth:`_pin_host_banks`; see the reason
+        there.
+        """
+        return tensor.detach().to("cpu").contiguous()
+
+    def _pin_host_banks(self) -> None:
+        """Page-lock the host banks, one bank at a time, after construction.
+
+        Pinned host memory is mapped into the GPU's address space -- that
+        mapping is exactly what lets the fused miss-copy kernel dereference a
+        host bank directly -- and on WDDM/WSL2 those mappings are charged
+        against the same per-GPU budget as device memory. Page-locking during
+        diversion therefore makes the banks compete with the model's own
+        construction allocations at their *peak*, and on a 24 GiB card the two
+        together overflow it: observed on real hardware as a driver-level
+        "CUDA error: out of memory" while building a later layer's attention
+        quant scales, with tens of GiB of host RAM still free. The settled
+        footprint does fit (7.1 GiB device + 16 GiB of banks per rank), so
+        pinning here -- after weight loading and process_weights_after_loading
+        have released their transients -- pins against that rather than the
+        peak.
+
+        Each pageable bank is released as soon as its pinned copy exists, so
+        host RAM never holds two full sets.
+        """
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda_alike():
+            torch.cuda.empty_cache()
+        for banks in self._layer_banks:
+            for param in banks.values():
+                host = param.data
+                if host.is_pinned():
+                    continue
+                # device="cpu" is explicit because post_init() may still run
+                # under the construction device context, whose torch_function
+                # mode fills in device=cuda for factory calls that omit it.
+                pinned = torch.empty_like(host, device="cpu", pin_memory=True)
+                pinned.copy_(host)
+                param.data = pinned
 
     def post_init(self) -> None:
         """Finalize the global slot cache once all layers have registered."""
@@ -185,6 +212,9 @@ class ExpertCacheOffloader(BaseOffloader):
         if self._num_experts is None:
             return
         assert self.quant_format is not None  # set on first diversion
+
+        if self.pin_memory:
+            self._pin_host_banks()
 
         num_layers = len(self._layer_banks)
         # Determine the target device (prefer CUDA if available).
