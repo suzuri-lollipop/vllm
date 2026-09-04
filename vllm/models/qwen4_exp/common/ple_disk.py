@@ -1409,7 +1409,18 @@ class PLEDiskStager:
         # across the TP group to recombine each rank's real contribution,
         # mirroring VocabParallelEmbedding's own masked-zero + all-reduce.
         num_tokens = output.shape[0]
-        output.masked_fill_(entry.mask_device[:num_tokens].unsqueeze(-1), 0)
+        mask = entry.mask_device[:num_tokens].unsqueeze(-1)
+        if output.element_size() == 1:
+            # masked_fill_ has no kernel for float8_e4m3fn -- the PLE table
+            # dtype -- confirmed on real hardware. A same-width uint8 view of
+            # the very same bytes does, and an all-zero byte pattern is +0.0
+            # in e4m3/e5m2, so the result is identical. Staying on
+            # masked_fill_ (rather than boolean-mask indexing) keeps this
+            # fixed-shape and CUDA-graph capturable, which the staged path
+            # exists to be.
+            output.view(torch.uint8).masked_fill_(mask, 0)
+        else:
+            output.masked_fill_(mask, 0)
 
     def verify_host_ids(self, layer_name: str, device_ids: torch.Tensor) -> None:
         """Compare device-hashed row ids against the host fill's ids.

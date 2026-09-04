@@ -1015,6 +1015,40 @@ def test_nvfp4_bank_geometry_bytes():
     assert cache.bank_caches["a13_gscale"].shape == (4, 1)
 
 
+def test_every_bank_row_keeps_the_fused_copy_plan_eligible():
+    """No bank may have a row size the device-driven copy cannot handle.
+
+    build_fused_copy_plan rejects the WHOLE plan if any single bank's row is
+    not a multiple of _BANK_ROW_ALIGN_BYTES, dropping every bank onto the
+    legacy host-count copy -- which host-synchronizes per bank per MoE layer
+    per step. On real hardware that alone made decode slow enough for vLLM's
+    `sample_tokens` RPC to time out, so a new bank whose row breaks the
+    alignment is a serious regression, not a cosmetic one.
+    """
+    from vllm.model_executor.layers.fused_moe.offload.fused_copy import (
+        _BANK_ROW_ALIGN_BYTES,
+    )
+
+    # The narrowest row any schema banks today: one fp32 per expert.
+    assert 4 % _BANK_ROW_ALIGN_BYTES == 0, (
+        "per-expert fp32 scalar rows (NVFP4's g/a scales) must stay eligible"
+    )
+
+    # "nvfp4_emulation" banks a subset of "nvfp4"'s names, so the nvfp4 cache
+    # already covers every row size it can produce.
+    caches = {
+        "bf16": make_cache(num_layers=1),
+        "fp8_block": _make_fp8_cache(),
+        "nvfp4": _make_nvfp4_cache(num_experts=4, cache_size=4),
+    }
+    for fmt, cache in caches.items():
+        for name, row_bytes in cache.bank_row_bytes().items():
+            assert row_bytes % _BANK_ROW_ALIGN_BYTES == 0, (
+                f"{fmt!r} bank {name!r} row is {row_bytes} bytes, which "
+                f"disqualifies the fused copy plan for every bank"
+            )
+
+
 class _MockQuantConfig:
     def __init__(self, method):
         self._method = method

@@ -161,7 +161,15 @@ class ExpertCacheOffloader(BaseOffloader):
         """Move a weight tensor to (optionally pinned) host memory."""
         host = tensor.detach().to("cpu")
         if self.pin_memory:
-            pinned = torch.empty_like(host, pin_memory=True)
+            # device="cpu" is load-bearing: diversion runs inside the model's
+            # construction device context (`with target_device`), whose
+            # torch_function mode fills in `device=cuda` for any factory call
+            # that does not name one. empty_like would then be asked for
+            # pinned memory *on the GPU*, which fails as
+            # "CUDA error: out of memory" no matter how much host RAM is free
+            # -- confirmed on real hardware, where pinning 36 GiB outside a
+            # device context succeeded while 16 GiB inside one did not.
+            pinned = torch.empty_like(host, device="cpu", pin_memory=True)
             pinned.copy_(host)
             host = pinned
         return host.contiguous()

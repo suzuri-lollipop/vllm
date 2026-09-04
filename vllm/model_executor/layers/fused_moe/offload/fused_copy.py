@@ -52,16 +52,23 @@ __all__ = [
 ]
 
 # Programs per bank in the fused launch. FreeToken measures the PCIe-bound copy
-# knee at ~4096 in-flight threads per bank; 8 programs x BLOCK_UNITS(1024) int64
+# knee at ~4096 in-flight threads per bank; 8 programs x BLOCK_UNITS int32
 # units x 8 warps covers it with one launch regardless of bank count.
 FUSED_COPY_BLOCKS_PER_BANK = 8
-# 8-byte units copied per program per loop iteration (1024 * 8B = 8 KiB).
-FUSED_COPY_BLOCK_UNITS = 1024
+# 4-byte units copied per program per loop iteration (2048 * 4B = 8 KiB, the
+# same bytes per iteration as the original 1024 x 8B).
+FUSED_COPY_BLOCK_UNITS = 2048
 
-# Bank rows are copied in 8-byte units; FreeToken's vectorized kernel requires
-# 16-byte row/base alignment, and we keep the same (stricter) constraint so
-# aligned rows stay uint4-aligned end to end.
-_BANK_ROW_ALIGN_BYTES = 16
+# Bank rows are copied in 4-byte units. FreeToken's vectorized kernel wanted
+# 16-byte rows (uint4 accesses), but a quantized schema banks per-expert scalar
+# scales alongside the weights -- NVFP4's w{13,2}_gscale2 / a{13,2}_gscale rows
+# are a single fp32, i.e. 4 bytes -- and a single such bank used to disqualify
+# the WHOLE plan, dropping every bank onto the legacy host-count copy. That path
+# host-synchronizes once per bank per MoE layer per step, which on real hardware
+# made decode so slow that vLLM's own `sample_tokens` RPC timed out. The copy is
+# PCIe-bound (host bank -> device slot), so narrowing the unit costs
+# little, while keeping the device-driven path is worth a great deal.
+_BANK_ROW_ALIGN_BYTES = 4
 
 
 @dataclass
@@ -238,7 +245,7 @@ if HAS_TRITON:
         feat = tl.load(feat_bytes_ptr + b)
         n = tl.load(num_indices_ptr)
 
-        units = feat // 8  # 8-byte units per row
+        units = feat // 4  # 4-byte units per row (see _BANK_ROW_ALIGN_BYTES)
         total = n * units
         start = s.to(tl.int64) * BLOCK_UNITS
         stride = BLOCKS_PER_BANK * BLOCK_UNITS
@@ -246,8 +253,8 @@ if HAS_TRITON:
         num_iters = (total - start + stride - 1) // stride
         num_iters = tl.maximum(num_iters, 0).to(tl.int32)
 
-        dst = dst_base.to(tl.pointer_type(tl.int64))
-        src = src_base.to(tl.pointer_type(tl.int64))
+        dst = dst_base.to(tl.pointer_type(tl.int32))
+        src = src_base.to(tl.pointer_type(tl.int32))
 
         for it in tl.range(num_iters):
             u = (

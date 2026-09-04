@@ -608,7 +608,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # free). Skipped at tp_size==1, where the mask is always all-False
         # anyway but the collective would still cost a no-op sync.
         if self.ngram_embedding.tp_size > 1:
-            rows = tensor_model_parallel_all_reduce(rows)
+            # Reduce in a wider dtype: the rows are the table's fp8, which
+            # has no all-reduce path we can count on. The round trip is
+            # lossless here -- every e4m3 value is exactly representable in
+            # bfloat16, and each row is contributed by exactly one rank with
+            # zeros from the others, so the sum is that one value unchanged.
+            rows = tensor_model_parallel_all_reduce(rows.to(torch.bfloat16)).to(
+                rows.dtype
+            )
         return rows.flatten(-2)
 
     def gather_disk_rows(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
