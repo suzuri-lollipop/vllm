@@ -393,8 +393,16 @@ def _make_offload_nvfp4_method(base_method):
             device = torch.device(
                 current_platform.device_type, torch.cuda.current_device()
             )
-            for name in self._CUTLASS_BANKED_PARAMS:
-                param = getattr(layer, name)
+            # Keep the Parameter objects that exist *now*: the base
+            # implementation below calls replace_parameter(), which installs
+            # brand new Parameter objects on the layer. ExpertCacheOffloader
+            # banked these original ones (it holds the Parameter itself, not a
+            # snapshot of .data), so the harvest at the end has to land on them
+            # too -- see the comment there.
+            originals = {
+                name: getattr(layer, name) for name in self._CUTLASS_BANKED_PARAMS
+            }
+            for param in originals.values():
                 param.data = param.data.to(device=device, non_blocking=True)
 
             super().process_weights_after_loading(layer)
@@ -420,6 +428,17 @@ def _make_offload_nvfp4_method(base_method):
                 host = torch.empty_like(param.data, device="cpu", pin_memory=pin)
                 host.copy_(param.data)
                 param.data = host
+                # Point the banked Parameter at the converted host tensor as
+                # well. replace_parameter() left it detached from the layer
+                # while it still owned the GPU copy made above, so without
+                # this every offloaded layer leaks a full expert layer of
+                # VRAM -- confirmed on real hardware as a load-time OOM that
+                # filled the GPU at the same point no matter how many layers
+                # --moe-gpu-resident-layers kept resident -- and post_init()
+                # would wire the slot cache to the stale, unconverted weights.
+                original = originals[name]
+                if original is not param:
+                    original.data = host
             # Force a lazy rebuild against the slot cache; the kernel/config
             # built by super() above referenced the transient GPU tensors.
             self.moe_kernel = None
