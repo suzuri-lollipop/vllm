@@ -267,6 +267,76 @@ def test_copy_missing_moves_missed_rows_into_slots():
         assert torch.equal(cache.bank_caches["w2"][slot], src_w2[e])
 
 
+def _force_stage_buffers(cache, rows: int) -> None:
+    """Install unpinned stand-ins for the legacy copy's staging buffers.
+
+    _alloc_stage_buffers page-locks, which needs a CUDA context the CPU test
+    machine does not have; the staged gather itself is device-independent, so
+    plain host buffers exercise exactly the same code.
+    """
+    cache._stage_buffers = [
+        torch.empty((rows, *c.shape[1:]), dtype=c.dtype) for _, c in cache.banks
+    ]
+
+
+def test_staged_miss_copy_matches_the_pageable_gather():
+    """The staging buffers must not change which rows land in which slots."""
+    ids = torch.tensor([2, 3, 0], dtype=torch.int32)
+
+    expected = make_cache(num_layers=1, num_experts=4, cache_size=4)
+    assert expected._stage_buffers is None, "CPU banks should not be page-locked"
+    expected.ensure_experts(0, ids.clone())
+    expected.copy_missing()
+
+    staged = make_cache(num_layers=1, num_experts=4, cache_size=4)
+    # Same random banks, so the two caches are comparable row for row.
+    staged.set_bank_sources(
+        {name: list(expected.bank_sources[name]) for name in expected.bank_schema}
+    )
+    _force_stage_buffers(staged, rows=4)
+    staged.ensure_experts(0, ids.clone())
+    staged.copy_missing()
+
+    for name in expected.bank_schema:
+        assert torch.equal(staged.bank_caches[name], expected.bank_caches[name])
+
+
+def test_staged_miss_copy_handles_narrow_float8_scale_banks():
+    """float8 scale rows have no index_select kernel; the byte view must work."""
+    cache = ExpertSlotCache(num_layers=1, num_experts=4, cache_size=4, device=CPU)
+    scales = torch.arange(4 * INTER, dtype=torch.float32).reshape(4, INTER)
+    cache.set_bank_sources(
+        {
+            "w13": [torch.randn(4, 2 * INTER, HIDDEN)],
+            "w2": [scales.to(torch.float8_e4m3fn)],
+        }
+    )
+    _force_stage_buffers(cache, rows=4)
+
+    src = cache.bank_sources["w2"][0]
+    ids = torch.tensor([3, 1], dtype=torch.int32)
+    cache.ensure_experts(0, ids)
+    cache.copy_missing()
+
+    for e in (3, 1):
+        slot = int(cache.slot_for_id[0, e].item())
+        got = cache.bank_caches["w2"][slot].view(torch.uint8)
+        assert torch.equal(got, src[e].view(torch.uint8))
+
+
+def test_staged_miss_copy_is_skipped_for_a_whole_layer_materialize():
+    """A materialize stages every expert, which overflows the small buffer."""
+    cache = make_cache(num_layers=1, num_experts=8, cache_size=8)
+    _force_stage_buffers(cache, rows=4)
+    src_w13 = cache.bank_sources["w13"][0]
+
+    cache.materialize_layer(0)
+    cache.copy_missing()
+
+    for e in range(8):
+        assert torch.equal(cache.bank_caches["w13"][e], src_w13[e])
+
+
 def test_copy_missing_materialize_copies_whole_layer():
     cache = make_cache(num_layers=1, num_experts=4, cache_size=4)
     src_w13 = cache.bank_sources["w13"][0]

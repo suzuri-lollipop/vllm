@@ -259,7 +259,7 @@ class ExpertCacheOffloader(BaseOffloader):
             self.cache_size,
             format_gib(total),
             "pinned" if self.pin_memory else "pageable",
-            "fused (device-driven)" if cache._fused_plan is not None else "legacy",
+            cache.miss_copy_description,
         )
 
     # ------------------------------------------------------------------

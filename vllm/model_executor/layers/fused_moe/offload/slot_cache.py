@@ -44,6 +44,13 @@ from vllm.model_executor.layers.fused_moe.offload.fused_copy import (
 
 logger = init_logger(__name__)
 
+# Experts one legacy miss copy can land in page-locked memory at a time. Sized
+# for decode -- a step misses at most topk * running-requests experts per layer,
+# and 32 covers the routing widths these checkpoints use with room to spare --
+# and kept small on purpose: WDDM charges page-locked memory against the GPU
+# budget, so this must stay in the tens of MiB (see _alloc_stage_buffers).
+_STAGE_ROWS = 32
+
 __all__ = [
     "BANK_SCHEMAS",
     "ExpertSlotCache",
@@ -221,6 +228,11 @@ class ExpertSlotCache:
         # Device-driven fused miss-copy descriptors (built by
         # set_bank_sources); None -> legacy host-count copy fallback.
         self._fused_plan: FusedCopyPlan | None = None
+        # Small page-locked landing buffers for the legacy copy, one per bank
+        # (allocated by set_bank_sources when the fused plan is unavailable);
+        # None -> gather straight out of the pageable bank. See
+        # _copy_missing_staged.
+        self._stage_buffers: list[torch.Tensor] | None = None
 
         # Double-buffered prefill streaming state. The first 2 * num_experts
         # slots are borrowed as two per-bank buffers ([2, E, ...]); populated by
@@ -280,6 +292,8 @@ class ExpertSlotCache:
         # Slot-cache allocations are now fixed: build the device-driven fused
         # miss-copy descriptors (None -> legacy host-count copy fallback).
         self._fused_plan = build_fused_copy_plan(self)
+        if self._fused_plan is None:
+            self._stage_buffers = self._alloc_stage_buffers()
         # The slot caches now exist: borrow the prefill double buffers.
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
@@ -370,6 +384,78 @@ class ExpertSlotCache:
             self.copy_done_event.record(self.copy_stream)
         compute_stream.wait_event(self.copy_done_event)
 
+    @property
+    def miss_copy_description(self) -> str:
+        """How misses reach the slot cache, for the startup banner."""
+        if self._fused_plan is not None:
+            return "fused (device-driven)"
+        if self._stage_buffers is not None:
+            return f"legacy via {self._stage_buffers[0].size(0)}-row pinned staging"
+        return "legacy (pageable)"
+
+    def _alloc_stage_buffers(self) -> list[torch.Tensor] | None:
+        """Page-locked landing buffers for the legacy miss copy, one per bank.
+
+        Without the fused plan every miss row is gathered on the CPU out of a
+        pageable bank and pushed with ``.to(device)``, which CUDA has to stage
+        through its own internal pinned buffer -- a second full copy of the
+        payload, on a path that cannot overlap compute. Gathering directly into
+        a page-locked buffer removes that copy and lets the H2D actually run
+        async on the copy stream.
+
+        Only decode is served this way; the buffer is deliberately tiny
+        (``_STAGE_ROWS`` experts, tens of MiB) because on WDDM page-locked
+        memory is charged against the GPU budget -- the reason the banks
+        themselves cannot be pinned here. A whole-layer materialize exceeds it
+        and falls back to the pageable gather.
+
+        Returns None when pinning is refused, which is not fatal: the caller
+        keeps the pageable path.
+        """
+        rows = min(self.cache_size, _STAGE_ROWS)
+        try:
+            return [
+                torch.empty(
+                    (rows, *cache.shape[1:]),
+                    dtype=cache.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for _, cache in self.banks
+            ]
+        except RuntimeError as exc:
+            logger.warning_once(
+                "expert_cache: could not page-lock the %d-row miss-copy "
+                "staging buffers (%s); falling back to pageable gathers, "
+                "which roughly halves host->device miss bandwidth.",
+                rows,
+                exc,
+            )
+            return None
+
+    def _copy_missing_staged(self, layer_id: int, n: int) -> None:
+        """Legacy miss copy that lands in the page-locked staging buffers."""
+        assert self._stage_buffers is not None
+        # The buffers are reused by every layer, so the host must not start
+        # overwriting them while the previous layer's H2D is still reading.
+        # By this point that copy has already been consumed by the previous
+        # layer's GEMM, so the wait is normally free.
+        if self.copy_done_event is not None:
+            self.copy_done_event.synchronize()
+        idx = self.src_indices[:n].to("cpu", dtype=torch.long)
+        slots = self.evict_slots[:n].to(torch.long)
+        for (per_layer, cache_tensor), stage in zip(self.banks, self._stage_buffers):
+            source = per_layer[layer_id]
+            rows = stage[:n]
+            src, dst = source, rows
+            if src.element_size() == 1:
+                # index_select has no kernel for the narrow float8 dtypes the
+                # quantized scale banks use; the gather is a pure byte move, so
+                # do it through a same-width integer view.
+                src, dst = src.view(torch.uint8), dst.view(torch.uint8)
+            torch.index_select(src, 0, idx, out=dst)
+            cache_tensor[slots] = rows.to(cache_tensor.device, non_blocking=True)
+
     def _copy_missing_reference(self, layer_id: int) -> None:
         """Host-count gather on the current stream (reference + legacy fallback).
 
@@ -377,12 +463,20 @@ class ExpertSlotCache:
         serves as the CPU-test reference implementation and as the fallback when
         the device-driven fused copy plan is unavailable.
         """
+        count: int | torch.Tensor = self.num_indices
+        if self._stage_buffers is not None:
+            # Read the count once and hand it on, so the fallback below does
+            # not sync a second time for the same copy.
+            count = int(self.num_indices.item())
+            if 0 < count <= self._stage_buffers[0].size(0):
+                self._copy_missing_staged(layer_id, count)
+                return
         fused_copy_rows_cpu(
             self.banks,
             layer_id,
             self.evict_slots,
             self.src_indices,
-            self.num_indices,
+            count,
         )
 
     # ------------------------------------------------------------------
